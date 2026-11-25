@@ -378,6 +378,134 @@ test('tool_progress frames map to tool.progress with millisecond elapsed time', 
   assert.deepEqual(unknown, [])
 })
 
+// ── T6 slice: usage accounting (usage_update vs result.usage) ────────────────
+//
+// Credits doc (codebuddy-sdk notes §8): every model call / generation tool
+// emits `system/usage_update` with the payload in `_meta['codebuddy.ai/turnUsage']`
+// (kind 'stage' mid-turn, kind 'snapshot' before the result); the result's own
+// `_meta['codebuddy.ai/turnUsage']` is IDENTICAL to the snapshot — so the two
+// families must never be mapped twice. `result.usage` is SESSION-CUMULATIVE
+// and maps to the per-turn delta on turn.end. The host books tokens from
+// assistant.message.usage (projection.ts bookUsage) — usage_update tokens ride
+// the custom event data and never become a second bookable copy.
+
+/** A usage_update stage frame the CLI emits after one model call. */
+function usageUpdateStage(stageId = 'model:msg_1', credits = 2) {
+  return {
+    type: 'system', subtype: 'usage_update', uuid: 'u-uu1', session_id: 'stub-session-0001',
+    _meta: { 'codebuddy.ai/turnUsage': { version: 1, scope: 'turn', kind: 'stage', requestId: 'req-1',
+      stage: { id: stageId, credits, delta: { credits } } } },
+  }
+}
+
+/** The turn-end snapshot usage_update (totals + per-stage list, no delta). */
+function usageUpdateSnapshot() {
+  return {
+    type: 'system', subtype: 'usage_update', uuid: 'u-uu2', session_id: 'stub-session-0001',
+    _meta: { 'codebuddy.ai/turnUsage': { version: 1, scope: 'turn', kind: 'snapshot', requestId: 'req-1',
+      total: { usage: { input_tokens: 10, output_tokens: 5 }, credits: 3, creditStatus: 'known' },
+      stages: [{ id: 'model:msg_1', credits: 2 }, { id: 'model:msg_2', credits: 1 }] } },
+  }
+}
+
+/** A result whose `_meta` duplicates the snapshot payload (credits doc: 完全相同). */
+function resultWithTurnUsageMeta(overrides = {}) {
+  return resultFrame({
+    _meta: { 'codebuddy.ai/turnUsage': { version: 1, scope: 'turn', kind: 'snapshot', requestId: 'req-1',
+      total: { usage: { input_tokens: 10, output_tokens: 5 }, credits: 3, creditStatus: 'known' },
+      stages: [{ id: 'model:msg_1', credits: 2 }, { id: 'model:msg_2', credits: 1 }] } },
+    ...overrides,
+  })
+}
+
+test('usage_update stage maps to a codebuddy.turn-usage custom event (defensive _meta parse)', () => {
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  const events = translator.translate(usageUpdateStage())
+  assert.equal(events.length, 1)
+  assert.deepEqual(events[0], {
+    type: 'custom', nativeType: 'codebuddy.turn-usage',
+    data: { kind: 'stage', requestId: 'req-1', stage: { id: 'model:msg_1', credits: 2, delta: { credits: 2 } } },
+  })
+})
+
+test('usage_update snapshot maps token totals and the stage count, never a bookable usage event', () => {
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  const events = translator.translate(usageUpdateSnapshot())
+  assert.equal(events.length, 1)
+  assert.equal(events[0].type, 'custom')
+  assert.equal(events[0].nativeType, 'codebuddy.turn-usage')
+  assert.deepEqual(events[0].data, {
+    kind: 'snapshot', requestId: 'req-1',
+    total: { usage: { input: 10, output: 5 }, credits: 3, creditStatus: 'known' },
+    stageCount: 2,
+  })
+})
+
+test('malformed usage_update payloads are ignored, never fatal', () => {
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  assert.deepEqual(translator.translate({ type: 'system', subtype: 'usage_update', uuid: 'u', session_id: 's' }), [])
+  assert.deepEqual(translator.translate({ type: 'system', subtype: 'usage_update', uuid: 'u', session_id: 's', _meta: {} }), [])
+  assert.deepEqual(translator.translate({ type: 'system', subtype: 'usage_update', uuid: 'u', session_id: 's', _meta: { 'codebuddy.ai/turnUsage': 'junk' } }), [])
+  assert.deepEqual(translator.translate({ type: 'system', subtype: 'usage_update', uuid: 'u', session_id: 's', _meta: { 'codebuddy.ai/turnUsage': { kind: 'galaxy' } } }), [])
+  // and the translator still works afterwards
+  assert.equal(translator.translate(usageUpdateStage()).length, 1)
+})
+
+test('a whole turn: usage_update emits NO bookable usage events — tokens stay on assistant.message', () => {
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator.translate(initFrame())
+  const events = []
+  events.push(...translator.userSubmitted({ text: 'hi', clientMessageId: 'u1' }))
+  events.push(...translator.translate(usageUpdateStage('model:msg_1', 1)))
+  events.push(...translator.translate(streamBurst('Hello')))
+  events.push(...translator.translate(assistantFrame('Hello')))
+  events.push(...translator.translate(usageUpdateStage('model:msg_1', 2)))
+  events.push(...translator.translate(usageUpdateSnapshot()))
+  events.push(...translator.translate(resultWithTurnUsageMeta()))
+  // The host books tokens from assistant.message.usage; a `usage` event here
+  // would double-book every token (projection.ts bookUsage reads both).
+  assert.ok(!events.some(e => e.type === 'usage'), 'no bookable usage event may derive from usage_update')
+  const message = events.find(e => e.type === 'assistant.message')
+  assert.deepEqual(message.usage, { input: 10, output: 5 })
+})
+
+test('anti-double-add: the snapshot usage_update and the identical result _meta yield exactly ONE credits event', () => {
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator.translate(initFrame())
+  const events = []
+  events.push(...translator.userSubmitted({ text: 'hi', clientMessageId: 'u1' }))
+  events.push(...translator.translate(usageUpdateStage('model:msg_1', 2)))
+  events.push(...translator.translate(usageUpdateStage('model:msg_2', 1)))
+  events.push(...translator.translate(assistantFrame('done')))
+  events.push(...translator.translate(usageUpdateSnapshot()))
+  // The result repeats the snapshot payload verbatim (credits doc) — the
+  // translator must not map it again.
+  events.push(...translator.translate(resultWithTurnUsageMeta()))
+  const credits = events.filter(e => e.type === 'custom' && e.nativeType === 'codebuddy.turn-usage')
+  assert.equal(credits.filter(e => e.data.kind === 'snapshot').length, 1, 'one snapshot event, not two')
+  assert.equal(credits.filter(e => e.data.kind === 'stage').length, 2)
+})
+
+test('anti-double-add: turn.end.usage deltas sum to the final session-cumulative, never re-add it', () => {
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator.translate(initFrame())
+  const endUsages = []
+  // Three turns whose result.usage is the SESSION-CUMULATIVE counter: 10→20→30.
+  for (let cumulative = 10; cumulative <= 30; cumulative += 10) {
+    const events = [
+      ...translator.userSubmitted({ text: 'hi', clientMessageId: `u${cumulative}` }),
+      ...translator.translate(assistantFrame('reply')),
+      ...translator.translate(resultFrame({ usage: { input_tokens: cumulative, output_tokens: cumulative / 2 } })),
+    ]
+    endUsages.push(events.find(e => e.type === 'turn.end').usage)
+  }
+  // Per-turn deltas, NOT the cumulative value repeated three times.
+  assert.deepEqual(endUsages, [{ input: 10, output: 5 }, { input: 10, output: 5 }, { input: 10, output: 5 }])
+  // The deltas sum exactly to the final cumulative — nothing double-added.
+  const sum = endUsages.reduce((acc, u) => ({ input: acc.input + u.input, output: acc.output + u.output }), { input: 0, output: 0 })
+  assert.deepEqual(sum, { input: 30, output: 15 })
+})
+
 // ── slice 3: tool cards — presentation is shape-driven, never name-keyed ─────
 
 test('tool.call carries a presentation card picked from the input shape, whatever the tool name', () => {

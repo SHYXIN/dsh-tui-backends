@@ -179,6 +179,9 @@ export function createCodebuddyTranslator({
         source: 'user',
         text: input.text ?? '',
         blocks: input.blocks ?? [],
+        // The attachment refs the channel handed in (T6): echoed verbatim so
+        // the user row renders its chips — the facade keeps the bytes lazy.
+        ...(Array.isArray(input.images) && input.images.length > 0 ? { images: input.images } : {}),
       },
       {
         type: 'turn.start',
@@ -284,10 +287,82 @@ export function createCodebuddyTranslator({
         provider: 'codebuddy',
       }]
     }
-    // status / compact_boundary / task_* / usage_update …: capabilities this
-    // bundle does not declare yet — ignored, never fatal (notes §2 lists them).
+    // usage_update (T6): the CLI's per-turn credits/tokens metering — the
+    // payload lives in `_meta['codebuddy.ai/turnUsage']`, a field the SDK
+    // 0.3.307 .d.ts does not even declare (type blind spot, notes §0), so the
+    // parse is defensive end to end. See translateUsageUpdate for the
+    // no-double-add policy against result.usage.
+    if (frame.subtype === 'usage_update') return seal(translateUsageUpdate(frame))
+    // status / compact_boundary / task_* …: capabilities this bundle does not
+    // declare yet — ignored, never fatal (notes §2 lists them).
     debug(`ignored system/${str(frame.subtype) ?? '?'}`)
     return []
+  }
+
+  /**
+   * `system/usage_update` → one `custom` event (the host's sanctioned escape
+   * hatch for vocabulary-external native data). The accounting policy (T6,
+   * "两套数字不得重复累加"):
+   *
+   * - CREDITS have no host-native slot (UsageDelta is tokens-only), so they
+   *   ride `custom` events with nativeType 'codebuddy.turn-usage'. Both the
+   *   mid-turn `stage` frames and the turn-end `snapshot` map through.
+   * - TOKENS are NOT re-emitted as bookable `usage` events: the host ledger
+   *   (projection.ts bookUsage) already books assistant.message.usage per
+   *   model call, and the usage_update numbers describe those same calls — a
+   *   second bookable copy would double every token. They stay visible as
+   *   data on the snapshot event (`total.usage`).
+   * - The result's own `_meta['codebuddy.ai/turnUsage']` is the snapshot
+   *   repeated verbatim (credits doc), so `result` frames never map it —
+   *   exactly one credits snapshot per turn.
+   * - The aggregation rule is the CLI's own (overwrite by
+   *   (session_id, requestId, stage.id)); the translator never sums
+   *   stage/delta/total/snapshot itself.
+   */
+  function translateUsageUpdate(frame) {
+    const meta = frame._meta
+    const raw = meta !== null && typeof meta === 'object' ? meta['codebuddy.ai/turnUsage'] : undefined
+    if (raw === null || typeof raw !== 'object') {
+      debug('usage_update without a turnUsage payload ignored')
+      return []
+    }
+    const kind = raw.kind === 'stage' || raw.kind === 'snapshot' ? raw.kind : undefined
+    if (kind === undefined) {
+      debug(`usage_update kind ${JSON.stringify(raw.kind)} ignored`)
+      return []
+    }
+    const data = { kind }
+    if (typeof raw.requestId === 'string' && raw.requestId !== '') data.requestId = raw.requestId
+    if (kind === 'stage') {
+      const stage = raw.stage
+      if (stage !== null && typeof stage === 'object') {
+        const stageOut = {}
+        if (typeof stage.id === 'string') stageOut.id = stage.id
+        if (typeof stage.credits === 'number') stageOut.credits = stage.credits
+        if (stage.delta !== null && typeof stage.delta === 'object') {
+          const delta = {}
+          if (typeof stage.delta.credits === 'number') delta.credits = stage.delta.credits
+          const deltaUsage = usageDelta(stage.delta.usage)
+          if (deltaUsage !== undefined) delta.usage = deltaUsage
+          if (Object.keys(delta).length > 0) stageOut.delta = delta
+        }
+        if (Object.keys(stageOut).length > 0) data.stage = stageOut
+      }
+    } else {
+      const total = raw.total
+      if (total !== null && typeof total === 'object') {
+        const totalOut = {}
+        const totalUsage = usageDelta(total.usage)
+        if (totalUsage !== undefined) totalOut.usage = totalUsage
+        if (typeof total.credits === 'number') totalOut.credits = total.credits
+        if (typeof total.creditStatus === 'string') totalOut.creditStatus = total.creditStatus
+        if (Object.keys(totalOut).length > 0) data.total = totalOut
+      }
+      // The full per-stage list is CLI-internal bookkeeping; the count keeps
+      // the event bounded without inventing a summary the CLI did not send.
+      if (Array.isArray(raw.stages)) data.stageCount = raw.stages.length
+    }
+    return [{ type: 'custom', nativeType: 'codebuddy.turn-usage', data }]
   }
 
   function translateStreamEvent(frame, time) {
@@ -506,6 +581,9 @@ export function createCodebuddyTranslator({
       debug('result outside a turn ignored')
       return []
     }
+    // Deliberately NOT mapped: `frame._meta['codebuddy.ai/turnUsage']` repeats
+    // the snapshot usage_update verbatim (credits doc) — mapping it would
+    // double the credits event for the turn (translateUsageUpdate).
     const ended = activeTurn
     activeTurn = null
     const events = closeOpenAttempt('aborted', time)
