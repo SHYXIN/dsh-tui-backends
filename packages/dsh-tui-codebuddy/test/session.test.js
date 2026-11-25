@@ -6,7 +6,7 @@
 // assertions run over the emitted AgentEvent batches.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -23,16 +23,15 @@ const SAVED_ENV = {
   CODEBUDDY_CODE_PATH: process.env.CODEBUDDY_CODE_PATH,
   CB_FAKE_SCRIPT: process.env.CB_FAKE_SCRIPT,
   CB_FAKE_MARKER_DIR: process.env.CB_FAKE_MARKER_DIR,
+  CB_INTERRUPT_SETTLE_MS: process.env.CB_INTERRUPT_SETTLE_MS,
 }
 test.after(() => {
   // Assigning `undefined` into process.env would stringify to "undefined";
   // restore the pre-test state by deleting absent keys.
-  if (SAVED_ENV.CODEBUDDY_CODE_PATH === undefined) delete process.env.CODEBUDDY_CODE_PATH
-  else process.env.CODEBUDDY_CODE_PATH = SAVED_ENV.CODEBUDDY_CODE_PATH
-  if (SAVED_ENV.CB_FAKE_SCRIPT === undefined) delete process.env.CB_FAKE_SCRIPT
-  else process.env.CB_FAKE_SCRIPT = SAVED_ENV.CB_FAKE_SCRIPT
-  if (SAVED_ENV.CB_FAKE_MARKER_DIR === undefined) delete process.env.CB_FAKE_MARKER_DIR
-  else process.env.CB_FAKE_MARKER_DIR = SAVED_ENV.CB_FAKE_MARKER_DIR
+  for (const key of ['CODEBUDDY_CODE_PATH', 'CB_FAKE_SCRIPT', 'CB_FAKE_MARKER_DIR', 'CB_INTERRUPT_SETTLE_MS']) {
+    if (SAVED_ENV[key] === undefined) delete process.env[key]
+    else process.env[key] = SAVED_ENV[key]
+  }
 })
 
 /** Minimal BackendHost stand-in: the session must feature-detect every
@@ -104,6 +103,16 @@ async function waitFor(batches, predicate, { timeoutMs = 5000, what = 'condition
     await new Promise(resolve => setTimeout(resolve, 15))
   }
   assert.fail(`timed out waiting for ${what}; events so far: ${JSON.stringify(flatten(batches).map(e => e.type))}`)
+}
+
+/** Stub-side evidence lives in marker files; wait for one to appear. */
+async function waitForMarker(markerDir, prefix, { timeoutMs = 5000, what = 'marker' } = {}) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (readdirSync(markerDir).some(name => name.startsWith(prefix))) return
+    await new Promise(resolve => setTimeout(resolve, 15))
+  }
+  assert.fail(`timed out waiting for ${what} (${prefix}*) in ${markerDir}`)
 }
 
 // Predicates receive the flattened EVENT list (waitFor flattens the batches).
@@ -370,6 +379,11 @@ test('cancel(interrupt) interrupts the running turn, drops queued inputs, and re
     // No interrupt receipt exists in SDK 0.3.307 — the outcome must be honest.
     assert.deepEqual(receipt, { stillQueued: [], outcome: 'unknown' })
 
+    // The interrupt signal really reached the CLI process — stub-side marker
+    // evidence (acceptance: the interrupt arrives at the CLI, not just in our
+    // own state).
+    await waitForMarker(open.markerDir, 'stub-interrupt-', { what: 'interrupt marker' })
+
     // The queued input is dropped with dropped:true (channel keeps it as a
     // held row for the user to resend).
     await waitFor(batches, evs => evs.some(e => e.type === 'pending.changed' && e.dropped === true), { what: 'dropped pending' })
@@ -411,6 +425,55 @@ test('cancel(user) keeps queued inputs: they run after the interrupted turn ends
   }
 })
 
+test('cancel at idle reports a confirmed receipt — a true snapshot of the live queue', async () => {
+  const open = await openSession()
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'short', clientMessageId: 'u1' }, 'turn')
+    await waitFor(batches, batches2 => turnEnded(batches2) >= 1, { what: 'turn end' })
+
+    // Nothing is in flight, so the local queue IS the live queue: confirmed
+    // is a real snapshot the channel may read as "the queue is now empty".
+    const receipt = await session.cancel('interrupt')
+    assert.deepEqual(receipt, { stillQueued: [], outcome: 'confirmed' })
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('cancel on a disposed session reports failed', async () => {
+  const open = await openSession()
+  try {
+    await open.session.dispose()
+    const receipt = await open.session.cancel('user')
+    assert.deepEqual(receipt, { stillQueued: [], outcome: 'failed' })
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('cancel on a dead CLI reports failed and the death was announced', async () => {
+  const open = await openSession({ scenario: { exitAfterFirstUser: true } })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'running', clientMessageId: 'uA' }, 'turn')
+    // The stub dies mid-turn without a result; the pump announces the loss.
+    await waitFor(batches, evs => evs.some(e => e.type === 'notice' && e.level === 'error'), { what: 'cli-exited notice' })
+    await waitForMarker(open.markerDir, 'stub-exit-', { what: 'stub exit marker' })
+
+    // There is no CLI left to cancel — the receipt must say failed, never
+    // confirmed (a failed cancel must not read as "the queue is empty").
+    const receipt = await session.cancel('interrupt')
+    assert.deepEqual(receipt, { stillQueued: [], outcome: 'failed' })
+  } finally {
+    await closeSession(open)
+  }
+})
+
 test('now placement interrupts the running turn and jumps the queue', async () => {
   const open = await openSession({ scenario: { turns: [HANGING_TURN, {}] } })
   try {
@@ -432,6 +495,73 @@ test('now placement interrupts the running turn and jumps the queue', async () =
   }
 })
 
+test('an interrupt the CLI never answers force-settles the turn; the session keeps going (bilingual notice)', async () => {
+  for (const locale of ['zh', 'en']) {
+    // Shorten the settle window for the test; production default is 15s.
+    process.env.CB_INTERRUPT_SETTLE_MS = '400'
+    const open = await openSession({
+      host: host({ locale }),
+      scenario: {
+        // "CLI 超时不回 result" line: the interrupt is acked but no result
+        // ever follows.
+        turns: [{ frames: [assistantFrame('never ends')], resultDelayMs: 60_000, interruptResult: 'none' }, {}],
+      },
+    })
+    try {
+      const session = open.session
+      const batches = collect(session)
+      await waitFor(batches, readySeen, { what: 'session.ready' })
+      await session.submit({ text: 'running', clientMessageId: 'uA' }, 'turn')
+      await waitFor(batches, evs => evs.some(e => e.type === 'assistant.message'), { what: 'turn in flight' })
+      await session.submit({ text: 'queued', clientMessageId: 'uS' }, 'steer')
+
+      const receipt = await session.cancel('user')
+      assert.deepEqual(receipt, { stillQueued: ['uS'], outcome: 'unknown' })
+      await waitForMarker(open.markerDir, 'stub-interrupt-', { what: 'interrupt marker' })
+
+      // Backstop: no result within the settle window → the turn is closed
+      // locally with a warning notice — never a permanent hang.
+      await waitFor(batches, evs => evs.some(e => e.type === 'turn.end' && e.reason.kind === 'aborted'), { what: 'forced turn end' })
+      const needle = locale === 'en' ? 'force-settled' : '强制收口'
+      const notice = flatten(batches).find(e => e.type === 'notice' && e.text.includes(needle))
+      assert.ok(notice, `${locale} notice explains the force-settle`)
+      assert.equal(notice.level, 'warning')
+
+      // The session keeps going: the kept steer input runs next and completes.
+      await waitFor(batches, evs => turnEnded(evs) >= 2, { what: 'queued input after backstop' })
+      const users = flatten(batches).filter(e => e.type === 'user.message').map(e => e.id)
+      assert.deepEqual(users, ['uA', 'uS'])
+      assert.equal(flatten(batches).filter(e => e.type === 'turn.end').at(-1).reason.kind, 'completed')
+    } finally {
+      await closeSession(open)
+    }
+  }
+})
+
+test('now jumps ahead of already-queued steer and followup inputs', async () => {
+  const open = await openSession({ scenario: { turns: [HANGING_TURN, {}, {}, {}] } })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'running', clientMessageId: 'uA' }, 'turn')
+    await waitFor(batches, evs => evs.some(e => e.type === 'assistant.message'), { what: 'turn in flight' })
+    await session.submit({ text: 'steer me', clientMessageId: 'uS' }, 'steer')
+    await session.submit({ text: 'after that', clientMessageId: 'uF' }, 'followup')
+
+    const accepted = await session.submit({ text: 'urgent', clientMessageId: 'uN' }, 'now')
+    assert.deepEqual(accepted, { accepted: true })
+
+    await waitFor(batches, evs => turnEnded(evs) >= 4, { what: 'all four turns' })
+    const users = flatten(batches).filter(e => e.type === 'user.message').map(e => e.id)
+    assert.deepEqual(users, ['uA', 'uN', 'uS', 'uF'], 'the urgent input runs first, queued inputs keep their order')
+    const reasons = flatten(batches).filter(e => e.type === 'turn.end').map(e => e.reason.kind)
+    assert.deepEqual(reasons, ['interrupted', 'completed', 'completed', 'completed'])
+  } finally {
+    await closeSession(open)
+  }
+})
+
 test('refusal reasons are bilingual: the host locale picks the wording', async () => {
   for (const locale of ['zh', 'en']) {
     const open = await openSession({ host: host({ locale }) })
@@ -444,6 +574,229 @@ test('refusal reasons are bilingual: the host locale picks the wording', async (
         locale === 'en' ? refused.reason.includes('disposed') : refused.reason.includes('已结束'),
         `${locale} reason: ${refused.reason}`,
       )
+    } finally {
+      await closeSession(open)
+    }
+  }
+})
+
+// ── slice 3: tool cards + the approval loop (ticket T3) ──────────────────────
+
+/** A scripted turn whose tool call needs approval: the stub parks on a
+ *  can_use_tool control request until the session answers. */
+function permissionGate({ toolUseId = 'toolu_gate_1', toolName = 'Bash', input = { command: 'echo gated' }, resultText = 'gated output' } = {}) {
+  return {
+    type: '_permission_gate',
+    toolUseId,
+    toolName,
+    input,
+    resultText,
+  }
+}
+
+/** The stub appends every can_use_tool control_response it receives to this
+ *  evidence file — the black-box record of what the SDK actually sent back. */
+function readPermissionEvidence(markerDir) {
+  const lines = []
+  try {
+    const raw = readFileSync(join(markerDir, 'stub-perm-responses.jsonl'), 'utf8')
+    for (const line of raw.split('\n')) {
+      if (line.trim() !== '') lines.push(JSON.parse(line))
+    }
+  } catch {
+    // no evidence yet
+  }
+  return lines
+}
+
+test('the approval loop closes: request → allow once → tool result → settled', async () => {
+  const open = await openSession({
+    scenario: { turns: [{ frames: [permissionGate()] }] },
+  })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'run gated', clientMessageId: 'u1' }, 'turn')
+
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.request'), { what: 'permission.request' })
+    const request = flatten(batches).find(e => e.type === 'permission.request').request
+    assert.equal(typeof request.requestId, 'string')
+    assert.equal(request.toolName, 'Bash')
+    assert.equal(request.callId, 'toolu_gate_1')
+    assert.deepEqual(request.input, { command: 'echo gated' })
+    assert.equal(request.command, 'echo gated', 'the panel names what the tool would do')
+    assert.equal(request.feedback, true, 'a typed reject reason is offered')
+    // The three options, in order, with backend-dict labels.
+    assert.deepEqual(request.options.map(o => o.kind), ['allow-once', 'allow-always', 'reject'])
+    assert.ok(request.options.every(o => typeof o.label === 'string' && o.label.length > 0))
+    assert.deepEqual(request.options.map(o => o.label), ['允许一次', '始终允许', '拒绝'])
+
+    // The session needs the user while the approval is open.
+    await waitFor(batches, evs => evs.some(e => e.type === 'session.status' && e.status === 'requires-action'), { what: 'requires-action' })
+    assert.deepEqual(session.capabilities.permissions.pending(), [request])
+
+    session.capabilities.permissions.respond(request.requestId, { kind: 'allow-once' })
+
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.settled'), { what: 'permission.settled' })
+    const settled = flatten(batches).find(e => e.type === 'permission.settled')
+    assert.deepEqual(settled, { type: 'permission.settled', requestId: request.requestId, outcome: 'allow-once' })
+
+    // The approved tool ran: the result card flows back through the CLI.
+    await waitFor(batches, evs => evs.some(e => e.type === 'tool.result'), { what: 'tool.result' })
+    const result = flatten(batches).find(e => e.type === 'tool.result')
+    assert.equal(result.callId, 'toolu_gate_1')
+    assert.equal(result.isError, false)
+    assert.equal(result.text, 'gated output')
+    await waitFor(batches, evs => turnEnded(evs) >= 1, { what: 'turn.end' })
+    assert.equal(session.status, 'idle')
+    assert.deepEqual(session.capabilities.permissions.pending(), [])
+
+    // Black-box SDK difference: the control_response the stub received must
+    // be a plain allow — SDK 0.3.307 forwards no updatedPermissions to the
+    // CLI (notes §5), and the bundle never sends one.
+    const evidence = readPermissionEvidence(open.markerDir)
+    assert.equal(evidence.length, 1)
+    assert.equal(evidence[0].allowed, true)
+    assert.equal(evidence[0].hasUpdatedPermissions, false)
+    assert.equal(evidence[0].toolUseId, 'toolu_gate_1')
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('allow-always resolves like a plain allow: persistence stays the CLI’s business', async () => {
+  const open = await openSession({
+    scenario: { turns: [{ frames: [permissionGate()] }] },
+  })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'run gated', clientMessageId: 'u1' }, 'turn')
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.request'), { what: 'permission.request' })
+    const request = flatten(batches).find(e => e.type === 'permission.request').request
+
+    session.capabilities.permissions.respond(request.requestId, { kind: 'allow-always' })
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.settled'), { what: 'permission.settled' })
+    assert.equal(flatten(batches).find(e => e.type === 'permission.settled').outcome, 'allow-always')
+    await waitFor(batches, evs => turnEnded(evs) >= 1, { what: 'turn.end' })
+
+    const evidence = readPermissionEvidence(open.markerDir)
+    assert.equal(evidence.length, 1)
+    assert.equal(evidence[0].allowed, true)
+    assert.equal(evidence[0].hasUpdatedPermissions, false, 'no updatedPermissions on the wire')
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('rejecting with a reason denies the CLI call and the denial flows back as the tool result', async () => {
+  const open = await openSession({
+    scenario: { turns: [{ frames: [permissionGate()] }] },
+  })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'run gated', clientMessageId: 'u1' }, 'turn')
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.request'), { what: 'permission.request' })
+    const request = flatten(batches).find(e => e.type === 'permission.request').request
+
+    session.capabilities.permissions.respond(request.requestId, { kind: 'reject', message: '不要跑这个' })
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.settled'), { what: 'permission.settled' })
+    assert.deepEqual(flatten(batches).find(e => e.type === 'permission.settled'), {
+      type: 'permission.settled', requestId: request.requestId, outcome: 'rejected',
+    })
+
+    // The CLI turned the denial into an error tool_result — the agent feels
+    // the refusal and the turn still closes cleanly.
+    await waitFor(batches, evs => turnEnded(evs) >= 1, { what: 'turn.end' })
+    const result = flatten(batches).find(e => e.type === 'tool.result')
+    assert.equal(result.isError, true)
+    assert.ok(result.errorText.includes('denied'))
+    const turnEnd = flatten(batches).find(e => e.type === 'turn.end')
+    assert.equal(turnEnd.reason.kind, 'completed')
+
+    const evidence = readPermissionEvidence(open.markerDir)
+    assert.equal(evidence.length, 1)
+    assert.equal(evidence[0].allowed, false)
+    assert.ok(String(evidence[0].reason).includes('不要跑这个'))
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('dispose withdraws pending approvals: the panel never hangs', async () => {
+  const open = await openSession({
+    scenario: { turns: [{ frames: [permissionGate()] }] },
+  })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'run gated', clientMessageId: 'u1' }, 'turn')
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.request'), { what: 'permission.request' })
+
+    await session.dispose()
+
+    // The parked request settled as cancelled and the pending list drained —
+    // the explicit no-hanging-panel assertion.
+    const settled = flatten(batches).find(e => e.type === 'permission.settled')
+    assert.ok(settled, 'a settled event was delivered on dispose')
+    assert.equal(settled.outcome, 'cancelled')
+    assert.deepEqual(session.capabilities.permissions.pending(), [])
+    assert.equal(session.status, 'disposed')
+    const turnEnd = flatten(batches).find(e => e.type === 'turn.end')
+    assert.deepEqual(turnEnd.reason, { kind: 'aborted', cause: 'disposed' })
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('cancel(interrupt) withdraws pending approvals too', async () => {
+  const open = await openSession({
+    scenario: { turns: [{ frames: [permissionGate()] }] },
+  })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'run gated', clientMessageId: 'u1' }, 'turn')
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.request'), { what: 'permission.request' })
+
+    await session.cancel('interrupt')
+
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.settled'), { what: 'permission.settled' })
+    assert.equal(flatten(batches).find(e => e.type === 'permission.settled').outcome, 'cancelled')
+    assert.deepEqual(session.capabilities.permissions.pending(), [])
+    await waitFor(batches, evs => turnEnded(evs) >= 1, { what: 'interrupted turn end' })
+    assert.equal(flatten(batches).find(e => e.type === 'turn.end').reason.kind, 'interrupted')
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('approval option labels speak the host locale: zh and en', async () => {
+  for (const locale of ['zh', 'en']) {
+    const open = await openSession({
+      host: host({ locale }),
+      scenario: { turns: [{ frames: [permissionGate()] }] },
+    })
+    try {
+      const session = open.session
+      const batches = collect(session)
+      await waitFor(batches, readySeen, { what: 'session.ready' })
+      await session.submit({ text: 'run gated', clientMessageId: 'u1' }, 'turn')
+      await waitFor(batches, evs => evs.some(e => e.type === 'permission.request'), { what: 'permission.request' })
+      const request = flatten(batches).find(e => e.type === 'permission.request').request
+      const expected = locale === 'en'
+        ? ['Allow once', 'Always allow', 'Deny']
+        : ['允许一次', '始终允许', '拒绝']
+      assert.deepEqual(request.options.map(o => o.label), expected, `${locale} labels`)
+      // Settle so the stub's turn ends cleanly before teardown.
+      session.capabilities.permissions.respond(request.requestId, { kind: 'allow-once' })
+      await waitFor(batches, evs => turnEnded(evs) >= 1, { what: 'turn.end' })
     } finally {
       await closeSession(open)
     }

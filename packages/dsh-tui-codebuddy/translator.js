@@ -21,6 +21,9 @@
  * frames. Anything this translator does not map returns [].
  */
 
+import { presentToolCall, presentToolResult } from './presentation.js'
+import { codebuddyText } from './text.js'
+
 const RESULT_ERROR_SUBTYPES = new Set(['error_during_execution', 'error_max_turns', 'error_max_budget_usd'])
 
 /**
@@ -113,6 +116,8 @@ class AssertionError extends Error {
  *   cwd: session working directory (fallback when init omits it)
  *   now: clock injection returning epoch ms
  *   debug: sink for ignored-frame diagnostics (opt-in host debug, never user-visible)
+ *   text: bilingual dict accessor `(key, params) => string`, pre-bound to the
+ *     live host locale by the session (direct translator use defaults to zh)
  *   replay: true for a resumed session — until `settleReplay()`, canonical
  *     protocol frames arriving OUTSIDE a turn are the CLI's persisted-history
  *     replay (ticket T5): user frames re-open their historical turn and every
@@ -120,7 +125,13 @@ class AssertionError extends Error {
  *     this mode (the session defers them until the settle), so the seq/turn
  *     counters flow straight from the replay into the live stream.
  */
-export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {}, replay = false } = {}) {
+export function createCodebuddyTranslator({
+  cwd,
+  now = Date.now,
+  debug = () => {},
+  text = (key, params) => codebuddyText(key, 'zh', params),
+  replay = false,
+} = {}) {
   const audit = createIdentityAudit()
 
   // ── identity-map state ──────────────────────────────────────────────────
@@ -132,6 +143,7 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
   let activeTurn = null // {number} while a turn is running
   const blockCalls = new Map() // stream content_block index → {callId, name, partialJson}
   const callLocation = new Map() // callId → {turn, step} recorded at tool.call
+  const callInputs = new Map() // callId → the model's input record, for the result card
   let readyEmitted = false
   let cumulativeUsage = null // session-cumulative tokens from the last result
   let replayMode = replay === true // resume replay phase; ends only at settleReplay()
@@ -361,6 +373,8 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
         const argsJson = JSON.stringify(block.input ?? {})
         const name = str(block.name) ?? ''
         callLocation.set(callId, { turn: attemptTurn, step: attemptStep })
+        if (block.input !== null && typeof block.input === 'object') callInputs.set(callId, block.input)
+        const presentation = presentToolCall(block.input, cwd)
         events.push({
           type: 'tool.call',
           seq: nextSeq(),
@@ -370,6 +384,7 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
           callId,
           name,
           argsJson,
+          ...(presentation !== undefined ? { presentation } : {}),
           time,
           ...(frame.parent_tool_use_id ? { parentCallId: str(frame.parent_tool_use_id) } : {}),
         })
@@ -419,8 +434,11 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
     for (const block of blocks) {
       const callId = str(block.tool_use_id) ?? ''
       const location = callLocation.get(callId) ?? { turn: activeTurn.number, step }
-      const { content: raw, text } = toolResultContent(block.content)
+      const { content: raw, text: resultText } = toolResultContent(block.content)
       const isError = block.is_error === true
+      // The settled card (bounded run-output tail for command-shaped calls);
+      // the full text stays in the persistent record below.
+      const presentation = presentToolResult(callInputs.get(callId), { isError, text: resultText }, text)
       events.push({
         type: 'tool.result',
         seq: nextSeq(),
@@ -430,8 +448,9 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
         isError,
         time,
         content: raw,
-        text,
-        ...(isError ? { errorText: text !== '' ? text : 'tool failed' } : {}),
+        text: resultText,
+        ...(isError ? { errorText: resultText !== '' ? resultText : 'tool failed' } : {}),
+        ...(presentation !== undefined ? { presentation } : {}),
         ...(frame.parent_tool_use_id ? { parentCallId: str(frame.parent_tool_use_id) } : {}),
       })
     }
@@ -520,16 +539,38 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
     }]
   }
 
-  /** `result` → TurnEndReason. CodeBuddy has no 'interrupted' subtype: an
-   *  interrupted turn still ends as subtype:'success' with a runtime-only
-   *  `terminal_reason` field (notes §2.2). */
+  /**
+   * `result` → TurnEndReason. Determination basis for the "interrupt is also a
+   * success" shape (T4, notes codebuddy-sdk §2.2 + §8, host-surface §1):
+   *
+   * The result subtype union has NO 'interrupted'/'hook_blocked' member —
+   * a user interrupt still ends the turn as
+   *   { type:'result', subtype:'success', is_error:false,
+   *     terminal_reason:'interrupt', result:'' }   // result '' when nothing
+   *                                                // had completed yet
+   * `terminal_reason` is a runtime-only field (absent from the 0.3.307 .d.ts)
+   * whose values come from the CLI's EXIT_REASONS tuple
+   * ('user_exit'|'interrupt'|'error'|'end_turn'|'max_turns'|'max_budget_usd');
+   * the error exits arrive as the error_* subtypes above, so here only the
+   * success family is left to split:
+   *   - terminal_reason 'interrupt'  → { kind:'interrupted' }  (Esc/cancel)
+   *   - 'end_turn' or field absent   → { kind:'completed' }    (older CLIs may
+   *     omit the runtime field entirely; absence must not read as a hang)
+   *   - anything else                → { kind:'other', label } — an unknown
+   *     CLI reason stays visible instead of masquerading as a completion.
+   * The empty `result` string of an interrupted turn is a secondary hint, NOT
+   * a test: a legitimately terse completion may also be short, so only the
+   * explicit terminal_reason decides.
+   */
   function turnEndReason(frame) {
     if (RESULT_ERROR_SUBTYPES.has(frame.subtype) || frame.is_error === true) {
       const errors = Array.isArray(frame.errors) ? frame.errors.filter(e => typeof e === 'string') : []
       return { kind: 'error', message: errors.join('; ') || str(frame.subtype) || 'error' }
     }
-    if (str(frame.terminal_reason) === 'interrupt') return { kind: 'interrupted' }
-    return { kind: 'completed' }
+    const terminal = str(frame.terminal_reason)
+    if (terminal === 'interrupt') return { kind: 'interrupted' }
+    if (terminal === undefined || terminal === 'end_turn') return { kind: 'completed' }
+    return { kind: 'other', label: terminal }
   }
 
   /** result.usage is session-cumulative; turn.end.usage wants the per-turn
