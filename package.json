@@ -1,19 +1,7 @@
 {
-  "name": "dsh-tui-codebuddy",
-  "version": "0.0.1",
+  "name": "dsh-tui-backends",
+  "version": "0.0.0",
   "private": true,
-  "type": "module",
-  "description": "Third-party CodeBuddy backend bundle for dsh-TUI, written against the frozen tui.dsh/v1alpha1 Backend contribution family.",
-  "license": "MIT",
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  },
-  "exports": {
-    ".": "./backend.js"
-  },
-  "dependencies": {
-    "@tencent-ai/agent-sdk": "0.3.307"
-  }
+  "description": "Third-party backend bundles for dsh-TUI — one bundle package per backend (CodeBuddy first).",
+  "license": "MIT"
 }
