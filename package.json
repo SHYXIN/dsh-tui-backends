@@ -3,5 +3,8 @@
   "version": "0.0.0",
   "private": true,
   "description": "Third-party backend bundles for dsh-TUI — one bundle package per backend (CodeBuddy first).",
-  "license": "MIT"
+  "license": "MIT",
+  "scripts": {
+    "test": "pnpm -r --workspace-concurrency=1 test"
+  }
 }
