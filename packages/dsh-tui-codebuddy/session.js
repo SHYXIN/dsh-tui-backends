@@ -202,7 +202,6 @@ export async function createCodebuddySession(target, host) {
   // PermissionResult the CLI expects. deliver/emit is hoisted, so the bridge
   // can be built before the query that receives canUseTool.
   const bridge = createCodebuddyPermissionBridge({
-    cwd,
     emit: deliver,
     debug,
     locale: () => localeOf(host),
