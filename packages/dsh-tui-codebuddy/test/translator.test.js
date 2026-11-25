@@ -373,6 +373,46 @@ test('terminal_reason hook_blocked maps to a blocked turn end — the host vocab
   createIdentityAudit().check(all)
 })
 
+test('a bare "Interrupted by user" assistant message is the 2.187.0 interrupt marker — the result needs no terminal_reason', () => {
+  // T7 real-machine evidence (docs/live-evidence.md): bundled 2.187.0's
+  // streaming-cancel path sends a result WITHOUT terminal_reason and
+  // synthesizes the assistant text "Interrupted by user" as the interrupt
+  // signal. Exact match only — a longer assistant text that merely contains
+  // the words must NOT read as interrupted, and the marker must not leak
+  // across turns.
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator.translate(initFrame())
+  let events = [...translator.userSubmitted({ text: 'go', clientMessageId: 'u1' })]
+  events.push(...translator.translate(assistantFrame('Interrupted by user')))
+  events.push(...translator.translate(resultFrame({ result: '' }))) // real-machine form: no terminal_reason
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'interrupted' })
+  createIdentityAudit().check(events)
+
+  // A text merely CONTAINING the marker words is a legitimate completion.
+  const translator2 = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator2.translate(initFrame())
+  events = [...translator2.userSubmitted({ text: 'go', clientMessageId: 'u1' })]
+  events.push(...translator2.translate(assistantFrame('The task was Interrupted by user manually.')))
+  events.push(...translator2.translate(resultFrame()))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'completed' })
+
+  // The marker seen in turn 1 must not leak into turn 2's judgment.
+  const translator3 = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator3.translate(initFrame())
+  events = [...translator3.userSubmitted({ text: 'a', clientMessageId: 'u1' })]
+  events.push(...translator3.translate(assistantFrame('Interrupted by user')))
+  events.push(...translator3.translate(resultFrame({ result: '' })))
+  events = [...translator3.userSubmitted({ text: 'b', clientMessageId: 'u2' })]
+  events.push(...translator3.translate(assistantFrame('all done')))
+  events.push(...translator3.translate(resultFrame()))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'completed' })
+
+  // terminal_reason='interrupt' stays the PRIMARY evidence when present.
+  events = [...translator3.userSubmitted({ text: 'c', clientMessageId: 'u3' })]
+  events.push(...translator3.translate(resultFrame({ terminal_reason: 'interrupt', result: '' })))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'interrupted' })
+})
+
 test('streaming tool-args deltas carry the partial JSON attributed to the callId', () => {
   const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
   translator.translate(initFrame())

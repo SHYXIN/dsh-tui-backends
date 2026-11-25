@@ -59,7 +59,7 @@
 ### known limitations（含 T7 真机 live 发现，证据见 live-evidence.md）
 
 - **回放 settle 策略（T5 + T7 live）**：真机 `--resume` 回放不含逐回合 result 帧——历史回合在种子中悬垂，只有最后一个回合带真实 result；`settleReplay()` 仅在仍有悬垂回合时合成收口（T5 的 fake-CLI 模型与真机不同）。编号连续性不受影响；种子 turn.end 不完整是既知形态，后续按真机证据校准。
-- **流式中断无 terminal_reason（T7 live）**：bundled 2.187.0 流式取消路径的 result 不携带 `terminal_reason`（CLI 源码无 `'interrupt'` 值；abort 路径是 `aborted_streaming`/`aborted_tools`），真机中断信号 = CLI 合成的 "Interrupted by user" 助手消息 + `turn.end{completed}`。翻译器的 `interrupted` 判定在真机流式路径不命中——中断收口本身不受影响，需后续票校准。
+- **流式中断无 terminal_reason（T7 live，已按真机校准）**：bundled 2.187.0 流式取消路径的 result 不携带 `terminal_reason`（CLI 源码无 `'interrupt'` 值；abort 路径是 `aborted_streaming`/`aborted_tools`），真机中断信号 = CLI 合成的 "Interrupted by user" 助手消息。code-review 修复（2026-11-26）：翻译器判定改为三线——`terminal_reason:'interrupt'`（主）∪ 精确匹配的真机合成文本标记（次级证据，逐回合、整串精确匹配防误伤）∪ 既有 force-settle 兜底；黑盒测试钉住「含该词的正常正文不误判」与「标记不跨回合泄漏」。
 - **init 懒发（T7 live）**：`system/init` 随首个 stdin 输入之后到达（不在握手时），依赖 init 时序的逻辑要按此顺序设计。
 - **init frame 无版本字段（T7 live）**：`codebuddy_code_version` 在 2.187.0 的 init 帧缺席，bundled CLI 版本证据只能来自 verify-contract 的捆绑包断言。
 - **双 CLI 版本并存**：detect 报 PATH 全局 CLI（2.186.0），会话实际跑 SDK 捆绑 CLI（2.187.0）——两个版本号会同时出现在证据里，属预期形态。

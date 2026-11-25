@@ -29,6 +29,11 @@
  *   { "sessionId"?: string, "model"?: string,
  *     "exitAfterFirstUser"?: boolean,             // die mid-turn, never result
  *     "afterInit"?: Frame[],                       // emitted once after init
+ *     "interruptStyle"?: 'real-2.187',             // interrupts close in the T7 real-machine
+ *                                                  // form: synthesized "Interrupted by user"
+ *                                                  // assistant message + result WITHOUT
+ *                                                  // terminal_reason (default: the documented
+ *                                                  // terminal_reason:'interrupt' form)
  *     "turns"?: [{ "frames"?: Frame[],             // emitted on the Nth user message
  *                 "resultDelayMs"?: number,        // delay before the default result
  *                 "interruptResult"?: 'none',      // ack interrupt, never emit result
@@ -464,7 +469,24 @@ function handleControlRequest(line) {
       if (currentScript?.interruptResult === 'none') break // never replies — backstop line
       if (resultTimer !== null) clearTimeout(resultTimer)
       resultTimer = null
-      if (turnOpen) defaultResult({ frame: { terminal_reason: 'interrupt', result: '' } })
+      if (turnOpen) {
+        if (scenario.interruptStyle === 'real-2.187') {
+          // T7 real-machine form (bundled 2.187.0 streaming cancel, docs/
+          // live-evidence.md): the CLI synthesizes the interrupt marker as an
+          // assistant message and closes with a SUCCESS result that carries
+          // NO terminal_reason.
+          out({
+            type: 'assistant', parent_tool_use_id: null,
+            message: { id: `msg_${uuidCounter + 1}`, type: 'message', role: 'assistant', model,
+              content: [{ type: 'text', text: 'Interrupted by user' }], stop_reason: 'end_turn', stop_sequence: null,
+              usage: { input_tokens: cumulativeInput, output_tokens: cumulativeOutput } },
+          })
+          defaultResult({ resultText: '' })
+        } else {
+          // The documented form (notes §8): terminal_reason on a success result.
+          defaultResult({ frame: { terminal_reason: 'interrupt', result: '' } })
+        }
+      }
       break
     }
     default:

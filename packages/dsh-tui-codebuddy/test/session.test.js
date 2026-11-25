@@ -332,6 +332,41 @@ test('dispose aborts a running turn, releases the CLI process, and rejects furth
 
 const HANGING_TURN = { frames: [assistantFrame('hanging')], resultDelayMs: 30_000 }
 
+test('an interrupt on the 2.187.0 real-machine form (no terminal_reason, synthesized marker) still ends interrupted', async () => {
+  // T7 real-machine calibration (docs/live-evidence.md): bundled 2.187.0's
+  // streaming-cancel path closes the turn with a result that carries NO
+  // terminal_reason and synthesizes the assistant text "Interrupted by
+  // user". The translator's exact-match marker evidence must turn that into
+  // turn.end{interrupted} — WITHOUT falling through to completed and without
+  // needing the force-settle backstop.
+  const open = await openSession({
+    scenario: { interruptStyle: 'real-2.187', turns: [HANGING_TURN] },
+  })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'running', clientMessageId: 'uA' }, 'turn')
+    await waitFor(batches, evs => evs.some(e => e.type === 'assistant.message'), { what: 'turn in flight' })
+
+    const receipt = await session.cancel('user')
+    assert.deepEqual(receipt, { stillQueued: [], outcome: 'unknown' })
+
+    await waitFor(batches, evs => evs.some(e => e.type === 'turn.end'), { what: 'real-machine interrupted turn end' })
+    const events = flatten(batches)
+    const turnEnd = events.find(e => e.type === 'turn.end')
+    assert.deepEqual(turnEnd.reason, { kind: 'interrupted' })
+    // The marker row the CLI synthesized is still a real transcript row.
+    const marker = events.filter(e => e.type === 'assistant.message').at(-1)
+    assert.ok(marker, 'the synthesized marker arrives as an assistant.message')
+    assert.deepEqual(marker.blocks, [{ kind: 'text', text: 'Interrupted by user' }])
+    // No force-settle needed: no warning notice about a forced close.
+    assert.ok(!events.some(e => e.type === 'notice' && e.level === 'warning'), 'the backstop did not have to fire')
+  } finally {
+    await closeSession(open)
+  }
+})
+
 test('a hook-blocked turn ends with turn.end{blocked} carrying the CLI detail', async () => {
   // The hook-blocked scenario line (spec issue #1 scenario coverage): the CLI
   // terminated the turn because a hook blocked it — a SUCCESS result carrying

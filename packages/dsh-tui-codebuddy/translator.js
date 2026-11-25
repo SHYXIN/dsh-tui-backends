@@ -27,6 +27,21 @@ import { codebuddyText } from './text.js'
 const RESULT_ERROR_SUBTYPES = new Set(['error_during_execution', 'error_max_turns', 'error_max_budget_usd'])
 
 /**
+ * T7 real-machine evidence (docs/live-evidence.md): the bundled 2.187.0
+ * streaming-cancel path sends its result WITHOUT terminal_reason (the CLI
+ * source has no 'interrupt' value; its abort paths report
+ * `aborted_streaming`/`aborted_tools` internally and emit nothing here) and
+ * instead SYNTHESIZES an assistant message whose text is exactly
+ * "Interrupted by user". That exact text is the SECONDARY interrupt evidence:
+ * primary evidence stays terminal_reason='interrupt' (CLIs that do send it),
+ * and the session-level force-settle backstop remains the third line of
+ * defense (session.js, T4). The match is EXACT (a model legitimately writing
+ * those words inside a longer sentence must not read as interrupted) and
+ * scoped to the current turn (cleared at every turn start).
+ */
+const INTERRUPT_MARKER_TEXT = 'Interrupted by user'
+
+/**
  * Identity-map audit: the invariant checker for the seq/turn/step/attemptId/
  * callId monotonic mapping (ticket T2 acceptance). One instance per session;
  * `check(events)` throws on the first violation, so a mapping bug fails
@@ -146,6 +161,7 @@ export function createCodebuddyTranslator({
   const callInputs = new Map() // callId → the model's input record, for the result card
   let readyEmitted = false
   let cumulativeUsage = null // session-cumulative tokens from the last result
+  let interruptMarkerSeen = false // the CLI's synthesized interrupt marker (T7), per turn
   let replayMode = replay === true // resume replay phase; ends only at settleReplay()
 
   const nextSeq = () => ++seq
@@ -162,6 +178,7 @@ export function createCodebuddyTranslator({
     const userMessageId = input.clientMessageId
     turn += 1
     step = 0
+    interruptMarkerSeen = false // the marker is per-turn evidence (T7)
     activeTurn = { number: turn }
     return seal([
       {
@@ -466,6 +483,13 @@ export function createCodebuddyTranslator({
       }
     }
 
+    // T7: the CLI's synthesized interrupt marker (exact text, exact frame) —
+    // secondary interrupt evidence consumed by turnEndReason when the result
+    // carries no terminal_reason.
+    if (blocks.some(block => block.kind === 'text' && block.text === INTERRUPT_MARKER_TEXT)) {
+      interruptMarkerSeen = true
+    }
+
     events.push({
       type: 'assistant.message',
       seq: nextSeq(),
@@ -556,6 +580,7 @@ export function createCodebuddyTranslator({
     }
     turn += 1
     step = 0
+    interruptMarkerSeen = false // the marker is per-turn evidence (T7)
     activeTurn = { number: turn }
     const anchor = str(frame.uuid) ?? `replay-user-${turn}`
     // No seal() here — translate() seals every batch exactly once; a second
@@ -632,6 +657,14 @@ export function createCodebuddyTranslator({
    * the error exits arrive as the error_* subtypes above, so here only the
    * success family is left to split:
    *   - terminal_reason 'interrupt'  → { kind:'interrupted' }  (Esc/cancel)
+   *     PRIMARY evidence. SECONDARY (T7 real-machine calibration): the
+   *     bundled 2.187.0 streaming-cancel path sends the result WITHOUT the
+   *     field and instead synthesizes the exact assistant text
+   *     "Interrupted by user" (INTERRUPT_MARKER_TEXT, checked at
+   *     translateAssistant, per-turn scoped, exact match) — an absent
+   *     terminal_reason + that marker still reads interrupted. An EXPLICIT
+   *     'end_turn' always beats the heuristic; the session-level force-settle
+   *     backstop (session.js, T4) stays the third line of defense.
    *   - terminal_reason 'hook_blocked' → { kind:'blocked', detail? }
    *     Basis (code-review fix, spec issue #1 scenario coverage): the CLI
    *     terminated the turn because a hook blocked it. host-surface notes §1
@@ -655,6 +688,7 @@ export function createCodebuddyTranslator({
     }
     const terminal = str(frame.terminal_reason)
     if (terminal === 'interrupt') return { kind: 'interrupted' }
+    if (terminal === undefined && interruptMarkerSeen) return { kind: 'interrupted' }
     if (terminal === 'hook_blocked') {
       const detail = errorStrings(frame).join('; ')
       return { kind: 'blocked', ...(detail !== '' ? { detail } : {}) }
