@@ -632,6 +632,15 @@ export function createCodebuddyTranslator({
    * the error exits arrive as the error_* subtypes above, so here only the
    * success family is left to split:
    *   - terminal_reason 'interrupt'  → { kind:'interrupted' }  (Esc/cancel)
+   *   - terminal_reason 'hook_blocked' → { kind:'blocked', detail? }
+   *     Basis (code-review fix, spec issue #1 scenario coverage): the CLI
+   *     terminated the turn because a hook blocked it. host-surface notes §1
+   *     declares NO hooks lifecycle event family (the approval/question
+   *     family is interactive, not a post-hoc verdict), so the sanctioned
+   *     vocabulary for "the turn ended because something blocked it" is
+   *     TurnEndReason{kind:'blocked', detail?}; the CLI's own error strings
+   *     (result.errors[], passthrough per notes §0) become the detail — and
+   *     stay absent when the CLI sent none (nothing invented).
    *   - 'end_turn' or field absent   → { kind:'completed' }    (older CLIs may
    *     omit the runtime field entirely; absence must not read as a hang)
    *   - anything else                → { kind:'other', label } — an unknown
@@ -642,11 +651,14 @@ export function createCodebuddyTranslator({
    */
   function turnEndReason(frame) {
     if (RESULT_ERROR_SUBTYPES.has(frame.subtype) || frame.is_error === true) {
-      const errors = Array.isArray(frame.errors) ? frame.errors.filter(e => typeof e === 'string') : []
-      return { kind: 'error', message: errors.join('; ') || str(frame.subtype) || text('turn-error') }
+      return { kind: 'error', message: errorStrings(frame).join('; ') || str(frame.subtype) || text('turn-error') }
     }
     const terminal = str(frame.terminal_reason)
     if (terminal === 'interrupt') return { kind: 'interrupted' }
+    if (terminal === 'hook_blocked') {
+      const detail = errorStrings(frame).join('; ')
+      return { kind: 'blocked', ...(detail !== '' ? { detail } : {}) }
+    }
     if (terminal === undefined || terminal === 'end_turn') return { kind: 'completed' }
     return { kind: 'other', label: terminal }
   }
@@ -693,6 +705,12 @@ export function createCodebuddyTranslator({
 
 function str(value) {
   return typeof value === 'string' ? value : undefined
+}
+
+/** result.errors[] → the string members only (the field is a runtime
+ *  passthrough the 0.3.307 .d.ts does not declare — notes §0). */
+function errorStrings(frame) {
+  return Array.isArray(frame.errors) ? frame.errors.filter(e => typeof e === 'string') : []
 }
 
 /** SDK Usage → the bundle's UsageDelta {input?, output?, cacheRead?, cacheWrite?}. */

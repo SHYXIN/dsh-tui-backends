@@ -349,6 +349,30 @@ test('terminal_reason variants: end_turn/absent complete, unknown values stay vi
   assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'other', label: 'user_exit' })
 })
 
+test('terminal_reason hook_blocked maps to a blocked turn end — the host vocabulary has no hooks event family', () => {
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator.translate(initFrame())
+  const all = []
+  // The hook-blocked shape: a success result (interrupts and blocks both ride
+  // the success subtype — codebuddy-sdk notes §2.2) carrying the runtime-only
+  // terminal_reason 'hook_blocked'.
+  let events = [...translator.userSubmitted({ text: 'hi', clientMessageId: 'u1' })]
+  events.push(...translator.translate(resultFrame({ terminal_reason: 'hook_blocked', errors: ['Stop hook: push denied'] })))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'blocked', detail: 'Stop hook: push denied' })
+  all.push(...events)
+  // No CLI error strings → bare blocked, detail stays absent (no invention).
+  events = [...translator.userSubmitted({ text: 'again', clientMessageId: 'u2' })]
+  events.push(...translator.translate(resultFrame({ terminal_reason: 'hook_blocked' })))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'blocked' })
+  all.push(...events)
+  // The generic unknown-reason escape stays for values outside the mapped set.
+  events = [...translator.userSubmitted({ text: 'third', clientMessageId: 'u3' })]
+  events.push(...translator.translate(resultFrame({ terminal_reason: 'user_exit' })))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'other', label: 'user_exit' })
+  all.push(...events)
+  createIdentityAudit().check(all)
+})
+
 test('streaming tool-args deltas carry the partial JSON attributed to the callId', () => {
   const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
   translator.translate(initFrame())

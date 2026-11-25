@@ -31,10 +31,14 @@
  *     "afterInit"?: Frame[],                       // emitted once after init
  *     "turns"?: [{ "frames"?: Frame[],             // emitted on the Nth user message
  *                 "resultDelayMs"?: number,        // delay before the default result
- *                 "interruptResult"?: 'none' }] }  // ack interrupt, never emit result
+ *                 "interruptResult"?: 'none',      // ack interrupt, never emit result
+ *                 "hookBlocked"?: boolean,         // the turn's result carries the
+ *                                                  // hook-blocked form (below)
+ *                 "hookBlockedDetail"?: string }]  // → result.errors[0]
  *     "resume"?: {                                 // only consulted with --resume in argv
  *       "sessionId"?: string,                      // session id declared at the handshake
  *       "unknownSession"?: true,                   // exit non-zero immediately: not found
+ *       "unknownDelayMs"?: number,                 // hold the boot unresponsive, then fail
  *       "historyDelayMs"?: number,                 // pacing between history turns
  *       "history"?: [{ "user": string,             // historical user message (text)
  *                     "assistant"?: Block[],       // assistant message after the user row
@@ -312,6 +316,26 @@ function defaultResult(extra = {}) {
   resultTimer = null
 }
 
+/** The turn's natural end — the docs-promise result. A turn scripted with
+ *  `hookBlocked` ends in the hook-blocked form instead (spec issue #1
+ *  scenario coverage): terminal_reason:'hook_blocked' on a SUCCESS result
+ *  (codebuddy-sdk notes §2.2/§8 — blocks and interrupts ride the success
+ *  subtype; terminal_reason is a runtime-only field), with the CLI's own
+ *  hook message as result.errors[0] when the script carries one. */
+function defaultTurnResult(script = null) {
+  if (script?.hookBlocked === true) {
+    defaultResult({
+      resultText: '',
+      frame: {
+        terminal_reason: 'hook_blocked',
+        ...(typeof script.hookBlockedDetail === 'string' ? { errors: [script.hookBlockedDetail] } : {}),
+      },
+    })
+    return
+  }
+  defaultResult()
+}
+
 function emitEchoTurn(userText) {
   const full = `echo: ${userText}`
   out({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'message_start', message: { id: `msg_${uuidCounter + 1}`, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } } })
@@ -361,10 +385,10 @@ async function emitScriptTurn(script) {
   if (typeof delay === 'number' && delay > 0) {
     // Leave the turn hanging until the delay or an interrupt — lets tests
     // cancel/steer mid-turn deterministically.
-    resultTimer = setTimeout(() => defaultResult(), delay)
+    resultTimer = setTimeout(() => defaultTurnResult(script), delay)
     return
   }
-  defaultResult()
+  defaultTurnResult(script)
 }
 
 function startTurn(userText) {

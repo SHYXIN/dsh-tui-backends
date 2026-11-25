@@ -332,6 +332,35 @@ test('dispose aborts a running turn, releases the CLI process, and rejects furth
 
 const HANGING_TURN = { frames: [assistantFrame('hanging')], resultDelayMs: 30_000 }
 
+test('a hook-blocked turn ends with turn.end{blocked} carrying the CLI detail', async () => {
+  // The hook-blocked scenario line (spec issue #1 scenario coverage): the CLI
+  // terminated the turn because a hook blocked it — a SUCCESS result carrying
+  // terminal_reason:'hook_blocked' (codebuddy-sdk notes §2.2/§8) plus its own
+  // error strings. No hooks event family exists in the host vocabulary
+  // (host-surface notes §1), so the sanctioned mapping is the blocked
+  // TurnEndReason.
+  const open = await openSession({
+    scenario: {
+      turns: [{ frames: [assistantFrame('working…')], hookBlocked: true, hookBlockedDetail: 'Stop hook: push denied' }],
+    },
+  })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'run', clientMessageId: 'u1' }, 'turn')
+
+    await waitFor(batches, evs => evs.some(e => e.type === 'turn.end'), { what: 'hook-blocked turn end' })
+    const events = flatten(batches)
+    const turnEnd = events.find(e => e.type === 'turn.end')
+    assert.deepEqual(turnEnd.reason, { kind: 'blocked', detail: 'Stop hook: push denied' })
+    assert.ok(events.some(e => e.type === 'assistant.message'), 'the turn ran before the hook blocked it')
+    assert.equal(session.status, 'idle', 'the session stays usable after a blocked turn')
+  } finally {
+    await closeSession(open)
+  }
+})
+
 test('steer and followup submitted while running queue up via pending.changed and run in arrival order', async () => {
   // Turn 1 ends on its own shortly after its message — the queued steer and
   // followup must then run in arrival order.
