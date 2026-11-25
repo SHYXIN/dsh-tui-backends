@@ -241,6 +241,7 @@ test('tool_use blocks become tool.call events and tool_result user frames become
   assert.deepEqual(call, {
     type: 'tool.call', seq: 2, anchor: 'u-0002', turn: 1, step: 1, callId: 'toolu_1',
     name: 'Bash', argsJson: '{"command":"echo hi"}', time: NOW(),
+    presentation: { card: 'terminal', title: 'echo hi', cwd: 'D:/fixture/project' },
   })
   // The message row itself carries no tool block (tools are their own family).
   const row = events.find(e => e.type === 'assistant.message')
@@ -355,4 +356,81 @@ test('tool_progress frames map to tool.progress with millisecond elapsed time', 
     tool_use_id: 'toolu_ghost', tool_name: 'Bash', elapsed_time_seconds: 2,
   })
   assert.deepEqual(unknown, [])
+})
+
+// ── slice 3: tool cards — presentation is shape-driven, never name-keyed ─────
+
+test('tool.call carries a presentation card picked from the input shape, whatever the tool name', () => {
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator.translate(initFrame())
+  const events = []
+  events.push(...translator.userSubmitted({ text: 'go', clientMessageId: 'u1' }))
+  // Three tool names the bundle has no table for: the card must come from the
+  // input shape alone (the ticket's "不按工具名特判").
+  events.push(...translator.translate({
+    type: 'assistant', uuid: 'u-0002', session_id: 's', parent_tool_use_id: null,
+    message: { id: 'msg_1', type: 'message', role: 'assistant', model: 'stub-model',
+      content: [
+        { type: 'tool_use', id: 'toolu_1', name: 'CustomRunner', input: { command: 'echo hi', description: 'greet' } },
+        { type: 'tool_use', id: 'toolu_2', name: 'ApplyPatch', input: { file_path: 'src/a.js', old_string: 'a', new_string: 'b' } },
+        { type: 'tool_use', id: 'toolu_3', name: 'Weird', input: { foo: 1 } },
+      ],
+      stop_reason: 'tool_use', stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } } },
+  ))
+  const calls = events.filter(e => e.type === 'tool.call')
+  assert.equal(calls.length, 3)
+  // A command-shaped input renders the terminal card — on an unknown name.
+  assert.deepEqual(calls[0].presentation, {
+    card: 'terminal', title: 'echo hi', description: 'greet', cwd: 'D:/fixture/project',
+  })
+  // An old/new string pair renders the diff card.
+  assert.deepEqual(calls[1].presentation, {
+    card: 'diff', title: 'src/a.js', diffs: [{ path: 'src/a.js', oldText: 'a', newText: 'b' }],
+  })
+  // A shape the picker does not recognise stays presentation-less: the host
+  // renders the neutral generic card from the args.
+  assert.equal(calls[2].presentation, undefined)
+  createIdentityAudit().check(events)
+})
+
+test('tool.result updates the card with a bounded run-output tail', () => {
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator.translate(initFrame())
+  const events = []
+  events.push(...translator.userSubmitted({ text: 'go', clientMessageId: 'u1' }))
+  events.push(...translator.translate({
+    type: 'assistant', uuid: 'u-0002', session_id: 's', parent_tool_use_id: null,
+    message: { id: 'msg_1', type: 'message', role: 'assistant', model: 'stub-model',
+      content: [{ type: 'tool_use', id: 'toolu_1', name: 'CustomRunner', input: { command: 'seq 1 250' } }],
+      stop_reason: 'tool_use', stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } } },
+  ))
+  const lines = Array.from({ length: 250 }, (_, i) => `line ${i + 1}`)
+  events.push(...translator.translate({
+    type: 'user', uuid: 'u-0003', session_id: 's', parent_tool_use_id: 'toolu_1',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: lines.join('\n') }] } },
+  ))
+  const result = events.find(e => e.type === 'tool.result')
+  // The persistent record keeps the full text; only the card output is a tail.
+  assert.ok(result.text.includes('line 1\n'))
+  const card = result.presentation
+  assert.equal(card.card, 'terminal')
+  const cardLines = card.output.split('\n')
+  assert.equal(cardLines.length, 201, 'dropped marker + the last 200 lines')
+  assert.match(cardLines[0], /50/)
+  assert.equal(cardLines[1], 'line 51')
+  assert.equal(cardLines.at(-1), 'line 250')
+  // A failed result keeps the plain-text card (no structured presentation).
+  events.push(...translator.translate({
+    type: 'assistant', uuid: 'u-0004', session_id: 's', parent_tool_use_id: null,
+    message: { id: 'msg_2', type: 'message', role: 'assistant', model: 'stub-model',
+      content: [{ type: 'tool_use', id: 'toolu_2', name: 'CustomRunner', input: { command: 'boom' } }],
+      stop_reason: 'tool_use', stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } } },
+  ))
+  events.push(...translator.translate({
+    type: 'user', uuid: 'u-0005', session_id: 's', parent_tool_use_id: 'toolu_2',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_2', content: 'boom', is_error: true }] } },
+  ))
+  const failed = events.filter(e => e.type === 'tool.result').at(-1)
+  assert.equal(failed.presentation, undefined)
+  createIdentityAudit().check(events)
 })

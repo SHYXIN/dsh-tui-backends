@@ -37,6 +37,24 @@ export const codebuddyTexts = {
     zh: 'CodeBuddy 后端内部错误：{{detail}}',
     en: 'CodeBuddy backend internal error: {{detail}}',
   },
+  'card-tail-dropped': {
+    zh: '（前 {{count}} 行已省略）',
+    en: '({{count}} earlier lines omitted)',
+  },
+  // Approval panel option labels (permission.request options); baked at park
+  // time in the live host locale.
+  'permission-allow-once': {
+    zh: '允许一次',
+    en: 'Allow once',
+  },
+  'permission-allow-always': {
+    zh: '始终允许',
+    en: 'Always allow',
+  },
+  'permission-reject': {
+    zh: '拒绝',
+    en: 'Deny',
+  },
 }
 
 /** Pick a text by locale and fill `{{name}}` params; an unknown locale/key

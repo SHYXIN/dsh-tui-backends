@@ -13,7 +13,10 @@
  * Environment:
  *   CB_FAKE_SCRIPT      scenario JSON path (optional; default = echo turns)
  *   CB_FAKE_MARKER_DIR  dir receiving `stub-start-<pid>` / `stub-exit-<pid>`
- *                       marker files, the explicit no-dangling-handle evidence
+ *                       marker files, the explicit no-dangling-handle evidence,
+ *                       plus `stub-perm-responses.jsonl` — every can_use_tool
+ *                       control_response the stub received, the black-box
+ *                       record of what the SDK answered on the wire
  *
  * Scenario shape:
  *   { "sessionId"?: string, "model"?: string,
@@ -21,9 +24,15 @@
  *     "turns"?: [{ "frames"?: Frame[],             // emitted on the Nth user message
  *                 "resultDelayMs"?: number }] }    // delay before the default result
  * Frames are written verbatim; `uuid` / `session_id` are default-filled.
+ * One frame kind is intercepted instead of written:
+ *   { "type": "_permission_gate", "toolUseId", "toolName", "input",
+ *     "resultText"? } — emits the tool_use assistant frame, then a real
+ *   can_use_tool control request, and holds the script until the SDK's
+ *   control_response arrives (allowed → the tool result; denied → an error
+ *   tool result carrying the reason, like a CLI reporting a refusal).
  */
 import readline from 'node:readline'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const markerDir = process.env.CB_FAKE_MARKER_DIR
@@ -90,6 +99,67 @@ let cumulativeInput = 0
 let cumulativeOutput = 0
 let turnOpen = false
 let resultTimer = null
+const turnDenials = []
+let permissionSeq = 0
+const pendingGates = new Map() // request_id → { toolUseId, toolName, input }
+const pendingGateWaits = new Map() // request_id → resolve() of the parked script
+
+function recordPermissionResponse(requestId, gate, response) {
+  if (!markerDir) return
+  try {
+    appendFileSync(join(markerDir, 'stub-perm-responses.jsonl'), `${JSON.stringify({
+      requestId,
+      toolUseId: gate?.toolUseId,
+      allowed: response?.allowed === true,
+      reason: typeof response?.reason === 'string' ? response.reason : undefined,
+      hasUpdatedPermissions: Object.hasOwn(response ?? {}, 'updatedPermissions'),
+    })}\n`)
+  } catch {
+    // evidence is best-effort; never break the stub over it
+  }
+}
+
+/** The permission gate: a real CLI→SDK can_use_tool control request, answered
+ *  by whatever the session's approval loop decides. */
+function requestPermissionGate(gate) {
+  permissionSeq += 1
+  const requestId = `stub-perm-${permissionSeq}`
+  pendingGates.set(requestId, gate)
+  out({
+    type: 'control_request',
+    request_id: requestId,
+    request: {
+      subtype: 'can_use_tool',
+      tool_name: gate.toolName,
+      input: gate.input,
+      tool_use_id: gate.toolUseId,
+    },
+  })
+  return requestId
+}
+
+/** A gate got its answer: emit the matching tool result — unless the turn was
+ *  already closed (interrupt/dispose), when the answer arrives too late. */
+function resolvePermissionGate(requestId, response) {
+  const gate = pendingGates.get(requestId)
+  pendingGates.delete(requestId)
+  recordPermissionResponse(requestId, gate, response)
+  if (gate === undefined || !turnOpen) return
+  if (response?.allowed === true) {
+    out({
+      type: 'user', parent_tool_use_id: gate.toolUseId,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: gate.toolUseId, content: gate.resultText ?? 'ok' }] },
+    })
+  } else {
+    turnDenials.push({ tool_name: gate.toolName, tool_use_id: gate.toolUseId, tool_input: gate.input })
+    out({
+      type: 'user', parent_tool_use_id: gate.toolUseId,
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: gate.toolUseId, content: `Permission denied: ${response?.reason ?? 'no reason given'}`, is_error: true }] },
+    })
+  }
+  pendingGateWaits.get(requestId)?.()
+  pendingGateWaits.delete(requestId)
+}
 
 function defaultResult(extra = {}) {
   cumulativeInput += 10
@@ -104,7 +174,7 @@ function defaultResult(extra = {}) {
     result: extra.resultText ?? 'done',
     total_cost_usd: 0.01,
     usage: { input_tokens: cumulativeInput, output_tokens: cumulativeOutput },
-    permission_denials: [],
+    permission_denials: turnDenials.splice(0),
     ...extra.frame,
   })
   turnOpen = false
@@ -129,11 +199,27 @@ function emitEchoTurn(userText) {
   defaultResult({ resultText: full })
 }
 
-function emitScriptTurn(script) {
+async function emitScriptTurn(script) {
   turnOpen = true
   let sawResult = false
   for (const frame of script.frames ?? []) {
     if (frame?.type === 'result') sawResult = true
+    if (frame?.type === '_permission_gate') {
+      // Emit the tool_use assistant frame, then park the script on the real
+      // can_use_tool request until the SDK answers.
+      out({
+        type: 'assistant', parent_tool_use_id: null,
+        message: { id: `msg_${uuidCounter + 1}`, type: 'message', role: 'assistant', model,
+          content: [{ type: 'tool_use', id: frame.toolUseId, name: frame.toolName, input: frame.input }],
+          stop_reason: 'tool_use', stop_sequence: null,
+          usage: { input_tokens: 10, output_tokens: 5 } },
+      })
+      const requestId = requestPermissionGate(frame)
+      await new Promise(resolve => {
+        pendingGateWaits.set(requestId, resolve)
+      })
+      continue
+    }
     out(frame)
   }
   if (sawResult) {
@@ -154,7 +240,10 @@ function startTurn(userText) {
   turnOpen = true
   const script = (scenario.turns ?? []).shift()
   if (script === undefined) return emitEchoTurn(userText)
-  emitScriptTurn(script)
+  emitScriptTurn(script).catch(() => {
+    // a broken scenario must not crash the stub process; the test times out
+    // and shows which wait never resolved
+  })
 }
 
 // ── control requests: always answer, or the SDK's 60s timeout fires ──────────
@@ -196,10 +285,16 @@ rl.on('line', raw => {
     return // non-JSON stdin noise is ignored, like the real CLI
   }
   if (line.type === 'control_request') return handleControlRequest(line)
+  if (line.type === 'control_response') {
+    // The SDK's answer to one of our can_use_tool requests.
+    const { request_id: requestId, response } = line.response ?? {}
+    if (pendingGates.has(requestId)) resolvePermissionGate(requestId, response)
+    return
+  }
   if (line.type === 'user') {
     const content = line.message?.content
     const text = typeof content === 'string' ? content : '(blocks)'
-    startTurn(text)
+    void startTurn(text) // the script may park on a permission gate
   }
 })
 rl.on('close', () => {

@@ -6,7 +6,7 @@
 // assertions run over the emitted AgentEvent batches.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -444,6 +444,229 @@ test('refusal reasons are bilingual: the host locale picks the wording', async (
         locale === 'en' ? refused.reason.includes('disposed') : refused.reason.includes('已结束'),
         `${locale} reason: ${refused.reason}`,
       )
+    } finally {
+      await closeSession(open)
+    }
+  }
+})
+
+// ── slice 3: tool cards + the approval loop (ticket T3) ──────────────────────
+
+/** A scripted turn whose tool call needs approval: the stub parks on a
+ *  can_use_tool control request until the session answers. */
+function permissionGate({ toolUseId = 'toolu_gate_1', toolName = 'Bash', input = { command: 'echo gated' }, resultText = 'gated output' } = {}) {
+  return {
+    type: '_permission_gate',
+    toolUseId,
+    toolName,
+    input,
+    resultText,
+  }
+}
+
+/** The stub appends every can_use_tool control_response it receives to this
+ *  evidence file — the black-box record of what the SDK actually sent back. */
+function readPermissionEvidence(markerDir) {
+  const lines = []
+  try {
+    const raw = readFileSync(join(markerDir, 'stub-perm-responses.jsonl'), 'utf8')
+    for (const line of raw.split('\n')) {
+      if (line.trim() !== '') lines.push(JSON.parse(line))
+    }
+  } catch {
+    // no evidence yet
+  }
+  return lines
+}
+
+test('the approval loop closes: request → allow once → tool result → settled', async () => {
+  const open = await openSession({
+    scenario: { turns: [{ frames: [permissionGate()] }] },
+  })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'run gated', clientMessageId: 'u1' }, 'turn')
+
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.request'), { what: 'permission.request' })
+    const request = flatten(batches).find(e => e.type === 'permission.request').request
+    assert.equal(typeof request.requestId, 'string')
+    assert.equal(request.toolName, 'Bash')
+    assert.equal(request.callId, 'toolu_gate_1')
+    assert.deepEqual(request.input, { command: 'echo gated' })
+    assert.equal(request.command, 'echo gated', 'the panel names what the tool would do')
+    assert.equal(request.feedback, true, 'a typed reject reason is offered')
+    // The three options, in order, with backend-dict labels.
+    assert.deepEqual(request.options.map(o => o.kind), ['allow-once', 'allow-always', 'reject'])
+    assert.ok(request.options.every(o => typeof o.label === 'string' && o.label.length > 0))
+    assert.deepEqual(request.options.map(o => o.label), ['允许一次', '始终允许', '拒绝'])
+
+    // The session needs the user while the approval is open.
+    await waitFor(batches, evs => evs.some(e => e.type === 'session.status' && e.status === 'requires-action'), { what: 'requires-action' })
+    assert.deepEqual(session.capabilities.permissions.pending(), [request])
+
+    session.capabilities.permissions.respond(request.requestId, { kind: 'allow-once' })
+
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.settled'), { what: 'permission.settled' })
+    const settled = flatten(batches).find(e => e.type === 'permission.settled')
+    assert.deepEqual(settled, { type: 'permission.settled', requestId: request.requestId, outcome: 'allow-once' })
+
+    // The approved tool ran: the result card flows back through the CLI.
+    await waitFor(batches, evs => evs.some(e => e.type === 'tool.result'), { what: 'tool.result' })
+    const result = flatten(batches).find(e => e.type === 'tool.result')
+    assert.equal(result.callId, 'toolu_gate_1')
+    assert.equal(result.isError, false)
+    assert.equal(result.text, 'gated output')
+    await waitFor(batches, evs => turnEnded(evs) >= 1, { what: 'turn.end' })
+    assert.equal(session.status, 'idle')
+    assert.deepEqual(session.capabilities.permissions.pending(), [])
+
+    // Black-box SDK difference: the control_response the stub received must
+    // be a plain allow — SDK 0.3.307 forwards no updatedPermissions to the
+    // CLI (notes §5), and the bundle never sends one.
+    const evidence = readPermissionEvidence(open.markerDir)
+    assert.equal(evidence.length, 1)
+    assert.equal(evidence[0].allowed, true)
+    assert.equal(evidence[0].hasUpdatedPermissions, false)
+    assert.equal(evidence[0].toolUseId, 'toolu_gate_1')
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('allow-always resolves like a plain allow: persistence stays the CLI’s business', async () => {
+  const open = await openSession({
+    scenario: { turns: [{ frames: [permissionGate()] }] },
+  })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'run gated', clientMessageId: 'u1' }, 'turn')
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.request'), { what: 'permission.request' })
+    const request = flatten(batches).find(e => e.type === 'permission.request').request
+
+    session.capabilities.permissions.respond(request.requestId, { kind: 'allow-always' })
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.settled'), { what: 'permission.settled' })
+    assert.equal(flatten(batches).find(e => e.type === 'permission.settled').outcome, 'allow-always')
+    await waitFor(batches, evs => turnEnded(evs) >= 1, { what: 'turn.end' })
+
+    const evidence = readPermissionEvidence(open.markerDir)
+    assert.equal(evidence.length, 1)
+    assert.equal(evidence[0].allowed, true)
+    assert.equal(evidence[0].hasUpdatedPermissions, false, 'no updatedPermissions on the wire')
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('rejecting with a reason denies the CLI call and the denial flows back as the tool result', async () => {
+  const open = await openSession({
+    scenario: { turns: [{ frames: [permissionGate()] }] },
+  })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'run gated', clientMessageId: 'u1' }, 'turn')
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.request'), { what: 'permission.request' })
+    const request = flatten(batches).find(e => e.type === 'permission.request').request
+
+    session.capabilities.permissions.respond(request.requestId, { kind: 'reject', message: '不要跑这个' })
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.settled'), { what: 'permission.settled' })
+    assert.deepEqual(flatten(batches).find(e => e.type === 'permission.settled'), {
+      type: 'permission.settled', requestId: request.requestId, outcome: 'rejected',
+    })
+
+    // The CLI turned the denial into an error tool_result — the agent feels
+    // the refusal and the turn still closes cleanly.
+    await waitFor(batches, evs => turnEnded(evs) >= 1, { what: 'turn.end' })
+    const result = flatten(batches).find(e => e.type === 'tool.result')
+    assert.equal(result.isError, true)
+    assert.ok(result.errorText.includes('denied'))
+    const turnEnd = flatten(batches).find(e => e.type === 'turn.end')
+    assert.equal(turnEnd.reason.kind, 'completed')
+
+    const evidence = readPermissionEvidence(open.markerDir)
+    assert.equal(evidence.length, 1)
+    assert.equal(evidence[0].allowed, false)
+    assert.ok(String(evidence[0].reason).includes('不要跑这个'))
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('dispose withdraws pending approvals: the panel never hangs', async () => {
+  const open = await openSession({
+    scenario: { turns: [{ frames: [permissionGate()] }] },
+  })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'run gated', clientMessageId: 'u1' }, 'turn')
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.request'), { what: 'permission.request' })
+
+    await session.dispose()
+
+    // The parked request settled as cancelled and the pending list drained —
+    // the explicit no-hanging-panel assertion.
+    const settled = flatten(batches).find(e => e.type === 'permission.settled')
+    assert.ok(settled, 'a settled event was delivered on dispose')
+    assert.equal(settled.outcome, 'cancelled')
+    assert.deepEqual(session.capabilities.permissions.pending(), [])
+    assert.equal(session.status, 'disposed')
+    const turnEnd = flatten(batches).find(e => e.type === 'turn.end')
+    assert.deepEqual(turnEnd.reason, { kind: 'aborted', cause: 'disposed' })
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('cancel(interrupt) withdraws pending approvals too', async () => {
+  const open = await openSession({
+    scenario: { turns: [{ frames: [permissionGate()] }] },
+  })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'run gated', clientMessageId: 'u1' }, 'turn')
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.request'), { what: 'permission.request' })
+
+    await session.cancel('interrupt')
+
+    await waitFor(batches, evs => evs.some(e => e.type === 'permission.settled'), { what: 'permission.settled' })
+    assert.equal(flatten(batches).find(e => e.type === 'permission.settled').outcome, 'cancelled')
+    assert.deepEqual(session.capabilities.permissions.pending(), [])
+    await waitFor(batches, evs => turnEnded(evs) >= 1, { what: 'interrupted turn end' })
+    assert.equal(flatten(batches).find(e => e.type === 'turn.end').reason.kind, 'interrupted')
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('approval option labels speak the host locale: zh and en', async () => {
+  for (const locale of ['zh', 'en']) {
+    const open = await openSession({
+      host: host({ locale }),
+      scenario: { turns: [{ frames: [permissionGate()] }] },
+    })
+    try {
+      const session = open.session
+      const batches = collect(session)
+      await waitFor(batches, readySeen, { what: 'session.ready' })
+      await session.submit({ text: 'run gated', clientMessageId: 'u1' }, 'turn')
+      await waitFor(batches, evs => evs.some(e => e.type === 'permission.request'), { what: 'permission.request' })
+      const request = flatten(batches).find(e => e.type === 'permission.request').request
+      const expected = locale === 'en'
+        ? ['Allow once', 'Always allow', 'Deny']
+        : ['允许一次', '始终允许', '拒绝']
+      assert.deepEqual(request.options.map(o => o.label), expected, `${locale} labels`)
+      // Settle so the stub's turn ends cleanly before teardown.
+      session.capabilities.permissions.respond(request.requestId, { kind: 'allow-once' })
+      await waitFor(batches, evs => turnEnded(evs) >= 1, { what: 'turn.end' })
     } finally {
       await closeSession(open)
     }
