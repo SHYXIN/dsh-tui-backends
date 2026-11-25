@@ -23,16 +23,15 @@ const SAVED_ENV = {
   CODEBUDDY_CODE_PATH: process.env.CODEBUDDY_CODE_PATH,
   CB_FAKE_SCRIPT: process.env.CB_FAKE_SCRIPT,
   CB_FAKE_MARKER_DIR: process.env.CB_FAKE_MARKER_DIR,
+  CB_INTERRUPT_SETTLE_MS: process.env.CB_INTERRUPT_SETTLE_MS,
 }
 test.after(() => {
   // Assigning `undefined` into process.env would stringify to "undefined";
   // restore the pre-test state by deleting absent keys.
-  if (SAVED_ENV.CODEBUDDY_CODE_PATH === undefined) delete process.env.CODEBUDDY_CODE_PATH
-  else process.env.CODEBUDDY_CODE_PATH = SAVED_ENV.CODEBUDDY_CODE_PATH
-  if (SAVED_ENV.CB_FAKE_SCRIPT === undefined) delete process.env.CB_FAKE_SCRIPT
-  else process.env.CB_FAKE_SCRIPT = SAVED_ENV.CB_FAKE_SCRIPT
-  if (SAVED_ENV.CB_FAKE_MARKER_DIR === undefined) delete process.env.CB_FAKE_MARKER_DIR
-  else process.env.CB_FAKE_MARKER_DIR = SAVED_ENV.CB_FAKE_MARKER_DIR
+  for (const key of ['CODEBUDDY_CODE_PATH', 'CB_FAKE_SCRIPT', 'CB_FAKE_MARKER_DIR', 'CB_INTERRUPT_SETTLE_MS']) {
+    if (SAVED_ENV[key] === undefined) delete process.env[key]
+    else process.env[key] = SAVED_ENV[key]
+  }
 })
 
 /** Minimal BackendHost stand-in: the session must feature-detect every
@@ -491,6 +490,73 @@ test('now placement interrupts the running turn and jumps the queue', async () =
     const turnStarts = flatten(batches).filter(e => e.type === 'turn.start')
     assert.deepEqual(turnStarts.map(e => e.userMessageId), ['uA', 'uN'], 'the urgent input runs right after the interrupt')
     assert.deepEqual(flatten(batches).filter(e => e.type === 'turn.end').map(e => e.reason.kind), ['interrupted', 'completed'])
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('an interrupt the CLI never answers force-settles the turn; the session keeps going (bilingual notice)', async () => {
+  for (const locale of ['zh', 'en']) {
+    // Shorten the settle window for the test; production default is 15s.
+    process.env.CB_INTERRUPT_SETTLE_MS = '400'
+    const open = await openSession({
+      host: host({ locale }),
+      scenario: {
+        // "CLI 超时不回 result" line: the interrupt is acked but no result
+        // ever follows.
+        turns: [{ frames: [assistantFrame('never ends')], resultDelayMs: 60_000, interruptResult: 'none' }, {}],
+      },
+    })
+    try {
+      const session = open.session
+      const batches = collect(session)
+      await waitFor(batches, readySeen, { what: 'session.ready' })
+      await session.submit({ text: 'running', clientMessageId: 'uA' }, 'turn')
+      await waitFor(batches, evs => evs.some(e => e.type === 'assistant.message'), { what: 'turn in flight' })
+      await session.submit({ text: 'queued', clientMessageId: 'uS' }, 'steer')
+
+      const receipt = await session.cancel('user')
+      assert.deepEqual(receipt, { stillQueued: ['uS'], outcome: 'unknown' })
+      await waitForMarker(open.markerDir, 'stub-interrupt-', { what: 'interrupt marker' })
+
+      // Backstop: no result within the settle window → the turn is closed
+      // locally with a warning notice — never a permanent hang.
+      await waitFor(batches, evs => evs.some(e => e.type === 'turn.end' && e.reason.kind === 'aborted'), { what: 'forced turn end' })
+      const needle = locale === 'en' ? 'force-settled' : '强制收口'
+      const notice = flatten(batches).find(e => e.type === 'notice' && e.text.includes(needle))
+      assert.ok(notice, `${locale} notice explains the force-settle`)
+      assert.equal(notice.level, 'warning')
+
+      // The session keeps going: the kept steer input runs next and completes.
+      await waitFor(batches, evs => turnEnded(evs) >= 2, { what: 'queued input after backstop' })
+      const users = flatten(batches).filter(e => e.type === 'user.message').map(e => e.id)
+      assert.deepEqual(users, ['uA', 'uS'])
+      assert.equal(flatten(batches).filter(e => e.type === 'turn.end').at(-1).reason.kind, 'completed')
+    } finally {
+      await closeSession(open)
+    }
+  }
+})
+
+test('now jumps ahead of already-queued steer and followup inputs', async () => {
+  const open = await openSession({ scenario: { turns: [HANGING_TURN, {}, {}, {}] } })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'running', clientMessageId: 'uA' }, 'turn')
+    await waitFor(batches, evs => evs.some(e => e.type === 'assistant.message'), { what: 'turn in flight' })
+    await session.submit({ text: 'steer me', clientMessageId: 'uS' }, 'steer')
+    await session.submit({ text: 'after that', clientMessageId: 'uF' }, 'followup')
+
+    const accepted = await session.submit({ text: 'urgent', clientMessageId: 'uN' }, 'now')
+    assert.deepEqual(accepted, { accepted: true })
+
+    await waitFor(batches, evs => turnEnded(evs) >= 4, { what: 'all four turns' })
+    const users = flatten(batches).filter(e => e.type === 'user.message').map(e => e.id)
+    assert.deepEqual(users, ['uA', 'uN', 'uS', 'uF'], 'the urgent input runs first, queued inputs keep their order')
+    const reasons = flatten(batches).filter(e => e.type === 'turn.end').map(e => e.reason.kind)
+    assert.deepEqual(reasons, ['interrupted', 'completed', 'completed', 'completed'])
   } finally {
     await closeSession(open)
   }

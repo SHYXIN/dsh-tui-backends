@@ -16,15 +16,24 @@
  * the public surface: `query()` + `Options` construction, `connect()`
  * (spawn + initialize handshake), `streamInput()` for stdin writes.
  *
- * Session semantics implemented in this ticket:
+ * Session semantics:
  * - subscribe: batch delivery with backlog replay for late subscribers
  *   (notes §2 convention);
  * - submit/placement: `turn` opens a turn when idle, FIFO-queues when busy;
- *   steer/followup queue (reported via pending.changed); `now` interrupts the
- *   running turn and jumps the queue — full mid-turn injection needs a CLI
- *   priority channel that SDK 0.3.307's streamInput does not have, T4 refines;
- * - cancel: interrupt control request; no interrupt receipt exists in
- *   SDK 0.3.307, so the receipt is honestly `unknown` while running;
+ *   steer/followup queue (reported via pending.changed) — SDK 0.3.307 consumes
+ *   the next stdin line only after the current result, so both deliver at the
+ *   same point and the placement label keeps them distinct; `now` interrupts
+ *   the running turn and takes the queue HEAD (T4) — see the four-semantics
+ *   comment in submit();
+ * - cancel: interrupt control request; SDK 0.3.307 has no turn-level receipt,
+ *   so a running cancel is honestly `unknown` while idle is `confirmed`
+ *   (the local queue IS the live queue) and a lost session is `failed` (T4);
+ *   sendControlRequest must never be called on a lost transport — the SDK
+ *   re-spawns the CLI (auto-start), see sendInterrupt();
+ * - interrupt force-settle backstop (T4): if the CLI never answers the
+ *   interrupt with a result, the turn is force-closed locally
+ *   (turn.end{aborted} + localized warning notice) and the session keeps
+ *   going — no permanent hang (claude's 30s precedent, recalibrated to 15s);
  * - dispose: stdin EOF closes the CLI (its own graceful shutdown; Windows
  *   backstop kill stays a backstop), synthesized turn end for the running
  *   turn, listeners left with a final session.status.
@@ -40,6 +49,23 @@ const BACKEND_ID = 'codebuddy'
 // 10s means the CLI is effectively gone — the session-level force-settle
 // backstop (below) owns the turn from there.
 const INTERRUPT_ACK_TIMEOUT_MS = 10_000
+
+// Force-settle backstop for an interrupt the CLI never answers with a result
+// (ticket T4: 不永久悬挂). Calibrated between the notes' reference durations:
+// CBC_CLI_EXIT_GRACE_MS (8000 ms, the SDK's Windows EOF-exit grace) is the
+// floor a dying CLI may still need; the SDK control-request handshake (60 s
+// default) is the ceiling; claude's precedent settles interrupts at 30 s.
+// 15 s sits above the process-exit grace and well below the handshake.
+// Override with CB_INTERRUPT_SETTLE_MS (tests shrink it); 0 disables — the
+// same opt-out convention as CBC_CLI_EXIT_GRACE_MS. Never fires on healthy
+// turns: it is armed only when an interrupt is actually requested.
+const DEFAULT_INTERRUPT_SETTLE_MS = 15_000
+
+function interruptSettleMs() {
+  const raw = Number(process.env.CB_INTERRUPT_SETTLE_MS)
+  if (raw === 0) return Number.POSITIVE_INFINITY // explicit opt-out
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_INTERRUPT_SETTLE_MS
+}
 
 function localeOf(host) {
   try {
@@ -159,6 +185,8 @@ export async function createCodebuddySession(target, host) {
   let backlog = [] // batches emitted before any subscriber
   const queue = [] // {clientMessageId, text, blocks, placement}
   const inbox = createInbox()
+  let settleTimer = null // interrupt force-settle backstop (armed per request)
+  let interruptRequested = false // an interrupt is outstanding for the active turn
 
   function deliver(events) {
     if (!Array.isArray(events) || events.length === 0) return
@@ -220,14 +248,49 @@ export async function createCodebuddySession(target, host) {
     inbox.push(userMessageFrame(item))
   }
 
-  /** A turn just ended: back to idle, then run the next queued input. */
+  /** A turn just ended: the outstanding interrupt settle is moot — drop it,
+   *  back to idle, then run the next queued input. */
   function drainQueue() {
+    clearInterruptSettle()
     if (disposed) return
     setStatus('idle')
     const next = queue.shift()
     if (next === undefined) return
     syncPending()
     beginTurn(next)
+  }
+
+  // ── interrupt force-settle backstop (ticket T4: 不永久悬挂) ──────────────
+  /** Arm the settle timer for a turn that was asked to interrupt. It fires
+   *  only while that turn is still running — a healthy CLI answers the
+   *  interrupt with a result in seconds and the timer is dropped at turn end
+   *  (drainQueue). Healthy turns WITHOUT an interrupt never arm it, so long
+   *  model/tool work is never killed by this clock. */
+  function armInterruptSettle() {
+    const ms = interruptSettleMs()
+    if (settleTimer !== null || disposed || status !== 'running' || ms === Number.POSITIVE_INFINITY) return
+    settleTimer = setTimeout(() => {
+      settleTimer = null
+      if (disposed || status !== 'running') return
+      // If the pump already closed the turn (dead transport path) there is
+      // nothing left to settle and no notice to fabricate.
+      const events = translator.abandonTurn({ kind: 'aborted' })
+      if (events.length === 0) return
+      interruptRequested = false
+      debug(`interrupt settle timeout (${ms} ms) — force-settling the running turn`)
+      deliver([{ type: 'notice', level: 'warning', text: codebuddyText('interrupt-forced-notice', localeOf(host), { seconds: Math.ceil(ms / 1000) }) }])
+      deliver(events)
+      drainQueue() // the session keeps going: kept/`now` inputs still run
+    }, ms)
+    settleTimer.unref?.()
+  }
+
+  function clearInterruptSettle() {
+    if (settleTimer !== null) {
+      clearTimeout(settleTimer)
+      settleTimer = null
+    }
+    interruptRequested = false
   }
 
   function userMessageFrame(item) {
@@ -272,7 +335,12 @@ export async function createCodebuddySession(target, host) {
     if (disposed || dead) return 'failed'
     // SDK 0.3.307 has no interrupt receipt — the CLI ends the interrupted turn
     // with a success result carrying terminal_reason:'interrupt' (notes §2.2),
-    // which the translator maps to turn.end{interrupted}.
+    // which the translator maps to turn.end{interrupted}. Arm the force-settle
+    // backstop now: if the result never comes, the turn still ends (locally)
+    // instead of hanging forever. Even a failed send arms it — the "CLI never
+    // replies" case is exactly what the backstop exists for.
+    interruptRequested = true
+    armInterruptSettle()
     try {
       // Short ack window: a dying CLI cannot ack, and the SDK's default 60s
       // request timer would then outlive the turn it was meant to end. (The
@@ -346,17 +414,32 @@ export async function createCodebuddySession(target, host) {
     const item = { clientMessageId, text, blocks: input?.blocks, placement: kind }
     if (status === 'running') {
       if (kind === 'now') {
-        // 笔记语义：now = 打断当前回合立即投递。SDK 0.3.307 的 streamInput 没有
-        // 优先级通道（claude 的 priority 'now' 在这里没有对应物），就近实现为：
-        // interrupt 当前回合 + 本输入插队，回合收口后第一个运行。T4 收口完整语义。
+        // Four-semantics table (host-surface notes §2): `now` = 打断当前回合
+        // 立即投递. SDK 0.3.307's streamInput has no priority channel (claude's
+        // priority 'now' has no counterpart here), so "immediately" lands as:
+        // the interrupt goes out NOW and this input takes the HEAD of the
+        // queue — ahead of any steer/followup already waiting — becoming the
+        // very next turn the moment the interrupted turn closes. Its submit
+        // pair (user.message + turn.start) is emitted only then, which keeps
+        // turn numbering monotonic for the channel (no interleaved turn
+        // ends). If the CLI never answers the interrupt, the force-settle
+        // backstop closes the turn and drainQueue starts this input anyway —
+        // the urgent message is never lost to a hung CLI.
         sendInterrupt()
         queue.unshift(item)
       } else {
+        // steer/followup: join the queue behind whatever is waiting. With
+        // SDK 0.3.307 the CLI consumes the next stdin line only after the
+        // current result (notes §3), so both placements deliver at the same
+        // point — the placement label (pending.changed) keeps them distinct
+        // for the channel.
         queue.push(item)
       }
       syncPending()
       return { accepted: true }
     }
+    // turn / followup / now when idle all open the next turn directly
+    // (notes §2: 空闲时等同普通 push).
     beginTurn(item)
     return { accepted: true }
   }
@@ -398,6 +481,9 @@ export async function createCodebuddySession(target, host) {
     if (disposePromise) return disposePromise
     disposePromise = (async () => {
       disposed = true
+      // The force-settle backstop must not fire into a session being torn
+      // down — dispose synthesizes its own turn end below.
+      clearInterruptSettle()
       // Synthesize the running turn's end locally — the CLI will never send a
       // result for it now. Delivered BEFORE the transport closes so the
       // channel sees the turn end.
