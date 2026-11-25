@@ -54,7 +54,7 @@ import { createCodebuddyPrefs } from './prefs.js'
 import { createCodebuddySettings } from './settings.js'
 import { createCodebuddyPermissionBridge } from './permissions.js'
 import { CODEBUDDY_IMAGE_LIMITS, codebuddyImageBlocks } from './images.js'
-import { codebuddyText } from './text.js'
+import { codebuddyText, localeOf } from './text.js'
 
 const BACKEND_ID = 'codebuddy'
 
@@ -87,14 +87,6 @@ function interruptSettleMs() {
   const raw = Number(process.env.CB_INTERRUPT_SETTLE_MS)
   if (raw === 0) return Number.POSITIVE_INFINITY // explicit opt-out
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_INTERRUPT_SETTLE_MS
-}
-
-function localeOf(host) {
-  try {
-    return host?.locale?.() === 'en' ? 'en' : 'zh'
-  } catch {
-    return 'zh'
-  }
 }
 
 function debugOf(host) {
@@ -154,7 +146,11 @@ function createInbox() {
 }
 
 export async function createCodebuddySession(target, host) {
-  const locale = localeOf(host)
+  // The bilingual accessor bound to the LIVE host locale — the ONE route for
+  // every user-visible string this session emits (notices, refusals, reasons,
+  // translator card text). locale() is read per call (notes §11), so a /lang
+  // switch applies to the next string; nothing is baked at open time.
+  const localeText = (key, params) => codebuddyText(key, localeOf(host), params)
   const isResume = target?.kind === 'resume'
   if (!isResume && target?.kind !== 'create') {
     throw new Error('dsh-tui-codebuddy: open target must be kind "create" or "resume"')
@@ -164,7 +160,7 @@ export async function createCodebuddySession(target, host) {
     : null
   if (isResume && resumeId === null) {
     // 响亮拒绝：没有有效会话 id 的 resume 不存在"猜一个"的路径。
-    throw new Error(codebuddyText('resume-invalid-target', locale))
+    throw new Error(localeText('resume-invalid-target'))
   }
   const cwd = typeof target?.cwd === 'string' && target.cwd !== '' ? target.cwd : host?.cwd
   if (typeof cwd !== 'string' || cwd === '') {
@@ -181,9 +177,6 @@ export async function createCodebuddySession(target, host) {
   // place through models.set (see the capability below).
   const settings = createCodebuddySettings(host)
   const savedModel = settings.model()
-  // The bilingual accessor bound to the LIVE host locale — one instance for
-  // the translator, image refusals, notices and refusal reasons alike.
-  const localeText = (key, params) => codebuddyText(key, localeOf(host), params)
 
   // Lazy SDK import: the bundle module itself must stay side-effect-free and
   // light (the Loader imports it before detect/open); the SDK is only loaded
@@ -291,7 +284,7 @@ export async function createCodebuddySession(target, host) {
     }
     const reason = String(error?.message ?? error)
     const detail = handshakeStderr !== '' ? `${reason} | stderr: ${handshakeStderr.trim()}` : reason
-    throw new Error(codebuddyText('resume-failed', locale, { detail }))
+    throw new Error(localeText('resume-failed', { detail }))
   }
 
   // ── session state ────────────────────────────────────────────────────────
@@ -448,7 +441,7 @@ export async function createCodebuddySession(target, host) {
       if (events.length === 0) return
       interruptRequested = false
       debug(`interrupt settle timeout (${ms} ms) — force-settling the running turn`)
-      deliver([{ type: 'notice', level: 'warning', text: codebuddyText('interrupt-forced-notice', localeOf(host), { seconds: Math.ceil(ms / 1000) }) }])
+      deliver([{ type: 'notice', level: 'warning', text: localeText('interrupt-forced-notice', { seconds: Math.ceil(ms / 1000) }) }])
       deliver(events)
       drainQueue() // the session keeps going: kept/`now` inputs still run
     }, ms)
@@ -535,7 +528,7 @@ export async function createCodebuddySession(target, host) {
   }
 
   function failNotice(detail) {
-    return { type: 'notice', level: 'error', text: codebuddyText('cli-exited-notice', localeOf(host), { detail }) }
+    return { type: 'notice', level: 'error', text: localeText('cli-exited-notice', { detail }) }
   }
 
   const pumpDone = (async () => {
@@ -555,7 +548,7 @@ export async function createCodebuddySession(target, host) {
           // notice, synthesized error turn end, session stays alive.
           const detail = String(error?.message ?? error)
           debug(`translate failed: ${detail}`)
-          deliver([{ type: 'notice', level: 'error', text: codebuddyText('internal-error-notice', localeOf(host), { detail }) }])
+          deliver([{ type: 'notice', level: 'error', text: localeText('internal-error-notice', { detail }) }])
           turnActive = false
           deliver(translator.abandonTurn({ kind: 'error', message: detail }))
           if (!disposed) drainQueue()
@@ -583,14 +576,13 @@ export async function createCodebuddySession(target, host) {
 
   // ── the four verbs ───────────────────────────────────────────────────────
   async function submit(input, placement = 'turn') {
-    const locale = localeOf(host)
-    if (disposed) return { accepted: false, reason: codebuddyText('submit-after-dispose', locale) }
-    if (dead) return { accepted: false, reason: codebuddyText('session-dead', locale) }
+    if (disposed) return { accepted: false, reason: localeText('submit-after-dispose') }
+    if (dead) return { accepted: false, reason: localeText('session-dead') }
     const text = typeof input?.text === 'string' ? input.text : ''
     const hasBlocks = Array.isArray(input?.blocks) && input.blocks.length > 0
     const images = Array.isArray(input?.images) ? input.images : []
     if (text === '' && !hasBlocks && images.length === 0) {
-      return { accepted: false, reason: codebuddyText('submit-empty', locale) }
+      return { accepted: false, reason: localeText('submit-empty') }
     }
     // Images (T6): read back and checked against the limits ONCE MORE at
     // submit (claude's convention — a limit change, a foreign facade); a
@@ -803,7 +795,7 @@ export async function createCodebuddySession(target, host) {
    *  footgun, same guard as sendInterrupt) — so they fail loudly instead. */
   async function listModels() {
     if (disposed || dead) {
-      throw new Error(codebuddyText('models-list-unavailable', localeOf(host)))
+      throw new Error(localeText('models-list-unavailable'))
     }
     const infos = await q.supportedModels()
     return (Array.isArray(infos) ? infos : [])
@@ -821,13 +813,12 @@ export async function createCodebuddySession(target, host) {
    *  open) → mirror the host's model.changed vocabulary. Refusals carry the
    *  localized reason. */
   async function setModel(ref) {
-    const locale = localeOf(host)
     const model = ref !== null && typeof ref === 'object' && typeof ref.model === 'string' ? ref.model : undefined
     if (model === undefined || model === '') {
-      return { kind: 'refused', reason: codebuddyText('model-invalid-ref', locale) }
+      return { kind: 'refused', reason: localeText('model-invalid-ref') }
     }
     if (disposed || dead) {
-      return { kind: 'refused', reason: codebuddyText('session-dead', locale) }
+      return { kind: 'refused', reason: localeText('session-dead') }
     }
     try {
       await q.transport.sendControlRequest({
@@ -836,7 +827,7 @@ export async function createCodebuddySession(target, host) {
         model,
       }, MODEL_ACK_TIMEOUT_MS)
     } catch (error) {
-      return { kind: 'refused', reason: codebuddyText('model-refused', locale, { detail: String(error?.message ?? error) }) }
+      return { kind: 'refused', reason: localeText('model-refused', { detail: String(error?.message ?? error) }) }
     }
     currentModel = model
     try {

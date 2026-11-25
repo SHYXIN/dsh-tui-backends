@@ -15,7 +15,7 @@ import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { codebuddyText } from './text.js'
+import { codebuddyText, localeOf } from './text.js'
 import { createCodebuddySession } from './session.js'
 import { createCodebuddyPrefs } from './prefs.js'
 
@@ -116,15 +116,10 @@ function hintResult(locale) {
 }
 
 /** Detect the user-installed `codebuddy` CLI. Never throws: an unavailable
- *  state is a detection, not a failure. */
+ *  state is a detection, not a failure. The locale read (live, hostile-proof)
+ *  is the shared localeOf from text.js — the same helper session.js uses. */
 export async function detect(host) {
-  let locale = 'zh'
   try {
-    try {
-      if (host?.locale?.() === 'en') locale = 'en'
-    } catch {
-      // A hostile locale() must not turn a detection into a throw.
-    }
     if (process.platform === 'win32') {
       const resolved = await locateCliOnPath().catch(() => undefined)
       const version = resolved !== undefined
@@ -138,7 +133,7 @@ export async function detect(host) {
     })
     return detectResult(firstNonEmptyLine(stdout))
   } catch {
-    return hintResult(locale)
+    return hintResult(localeOf(host))
   }
 }
 

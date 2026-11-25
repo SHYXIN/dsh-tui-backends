@@ -112,6 +112,18 @@ export const codebuddyTexts = {
   },
 }
 
+/** The live host-locale read, shared by every module that emits user-visible
+ *  text (host-surface notes §11: `locale()` is 必有 and read LIVE — a /lang
+ *  switch applies to the next string, never a snapshot taken at open; a
+ *  hostile locale() implementation degrades to zh, never a throw). */
+export function localeOf(host) {
+  try {
+    return host?.locale?.() === 'en' ? 'en' : 'zh'
+  } catch {
+    return 'zh'
+  }
+}
+
 /** Pick a text by locale and fill `{{name}}` params; an unknown locale/key
  *  falls back to zh / the key, and a param the template names but the caller
  *  did not provide stays visible (never swallowed into an empty string).

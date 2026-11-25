@@ -118,11 +118,28 @@ const resumeFlagIndex = process.argv.indexOf('--resume')
 const resumeTargetId = resumeFlagIndex !== -1 ? process.argv[resumeFlagIndex + 1] : undefined
 const resumeSpec = resumeTargetId !== undefined ? (scenario.resume ?? {}) : null
 
+// A paced unknown-session boot: set before anything emits — the stub stays
+// silent (no init, no control responses) until the delayed loud exit.
+let unresponsiveBoot = false
+
 if (resumeSpec?.unknownSession === true) {
   // 指定会话不存在：CLI 响亮退出（非零），绝不静默回落新会话。
-  mark('exit', 1)
-  process.stderr.write(`codebuddy stub: session ${resumeTargetId} not found\n`)
-  process.exit(1)
+  // `unknownDelayMs` paces the failure (tests flip the host locale while the
+  // handshake is in flight — the emitted wording must follow the LIVE locale):
+  // during the hold the stub answers NOTHING (no init frame, no initialize
+  // response), so connect() itself rejects when the process dies.
+  const delay = resumeSpec.unknownDelayMs
+  const die = () => {
+    mark('exit', 1)
+    process.stderr.write(`codebuddy stub: session ${resumeTargetId} not found\n`)
+    process.exit(1)
+  }
+  if (typeof delay === 'number' && delay > 0) {
+    unresponsiveBoot = true
+    setTimeout(die, delay)
+  } else {
+    die()
+  }
 }
 
 const sessionId = resumeSpec !== null
@@ -134,6 +151,7 @@ let uuidCounter = 0
 const nextUuid = () => `u-${String(++uuidCounter).padStart(4, '0')}`
 
 function out(frame) {
+  if (unresponsiveBoot) return
   const filled = {
     uuid: nextUuid(),
     session_id: sessionId,
@@ -433,6 +451,7 @@ function handleControlRequest(line) {
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false, crlfDelay: Infinity })
 rl.on('line', raw => {
+  if (unresponsiveBoot) return
   if (!raw.trim()) return
   let line
   try {

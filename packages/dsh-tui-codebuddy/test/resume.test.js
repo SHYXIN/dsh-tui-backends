@@ -119,6 +119,44 @@ test('opening a create session records it as this backend\'s lastSession (file s
   }
 })
 
+test('resume failure wording follows the LIVE host locale, not the open-time snapshot', async () => {
+  // host-surface notes §11: locale() is read live — a /lang switch applies to
+  // the NEXT string the backend emits. The host answers zh during the first
+  // 200 ms (the open-time window) and en afterwards; the stub holds the failed
+  // handshake for 500 ms, so the loud resume failure — emitted after the flip
+  // — must be worded in the CURRENT locale, never the open-time snapshot.
+  const t0 = Date.now()
+  const flippingHost = host({ locale: 'zh' })
+  flippingHost.locale = () => (Date.now() - t0 < 200 ? 'zh' : 'en')
+  const world = mkdtempSync(join(tmpdir(), 'codebuddy-resume-'))
+  const projectDir = join(world, 'project')
+  const markerDir = join(world, 'markers')
+  mkdirSync(projectDir)
+  mkdirSync(markerDir)
+  writeFileSync(join(world, 'scenario.json'), JSON.stringify({ resume: { unknownSession: true, unknownDelayMs: 500 } }))
+  const savedScript = process.env.CB_FAKE_SCRIPT
+  const savedMarker = process.env.CB_FAKE_MARKER_DIR
+  process.env.CB_FAKE_SCRIPT = join(world, 'scenario.json')
+  process.env.CB_FAKE_MARKER_DIR = markerDir
+  try {
+    await assert.rejects(
+      () => backend.open({ kind: 'resume', sessionId: 'no-such-session' }, flippingHost),
+      error => {
+        assert.ok(error instanceof Error)
+        assert.ok(error.message.includes('resume failed'), `en wording expected, got: ${error.message}`)
+        assert.ok(!error.message.includes('恢复失败'), `stale open-time zh wording leaked: ${error.message}`)
+        return true
+      },
+    )
+  } finally {
+    process.env.CB_FAKE_SCRIPT = savedScript
+    if (savedScript === undefined) delete process.env.CB_FAKE_SCRIPT
+    process.env.CB_FAKE_MARKER_DIR = savedMarker
+    if (savedMarker === undefined) delete process.env.CB_FAKE_MARKER_DIR
+    await rmWithRetry(world)
+  }
+})
+
 test('opening a resume session re-points lastSession at the resumed id (memory store)', async () => {
   const testHost = host()
   const prefs = createCodebuddyPrefs(testHost)
