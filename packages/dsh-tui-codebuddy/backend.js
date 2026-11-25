@@ -16,6 +16,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { codebuddyText } from './text.js'
+import { createCodebuddySession } from './session.js'
 
 const run = promisify(execFile)
 
@@ -140,9 +141,11 @@ export async function detect(host) {
   }
 }
 
-/** Not implemented yet — the MVP session lands next (docs/decisions.md). */
-export async function open() {
-  throw new Error('dsh-tui-codebuddy: session implementation not started yet (MVP scope in docs/decisions.md)')
+/** Open a real CodeBuddy session: one long-lived streaming `query()` per
+ *  session (session.js). Resume targets are loudly refused until the
+ *  --resume replay lands (T5); create targets carry the session cwd. */
+export async function open(target, host) {
+  return createCodebuddySession(target, host)
 }
 
 export const backend = {
