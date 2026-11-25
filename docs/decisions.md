@@ -42,3 +42,7 @@
 - codebuddy CLI：v2.186.0（`codebuddy.ps1` 经 nvm4w 全局）
 - Node v24.14.0 / pnpm 11.21.0
 - gh 认证：keyring（SHYXIN）
+
+## Spec
+
+MVP 规格已发布到 issue tracker 并打上 `ready-for-agent`：[#1 Spec: CodeBuddy 后端 bundle MVP](https://github.com/SHYXIN/dsh-tui-backends/issues/1)。测试缝（已确认）：backend handler 导出面黑盒 + 假 CLI 桩（`CODEBUDDY_CODE_PATH` 注入）+ 上游装配链复用 + live 手工冒烟。
