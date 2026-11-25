@@ -62,9 +62,14 @@
 - **流式中断无 terminal_reason（T7 live，已按真机校准）**：bundled 2.187.0 流式取消路径的 result 不携带 `terminal_reason`（CLI 源码无 `'interrupt'` 值；abort 路径是 `aborted_streaming`/`aborted_tools`），真机中断信号 = CLI 合成的 "Interrupted by user" 助手消息。code-review 修复（2026-11-26）：翻译器判定改为三线——`terminal_reason:'interrupt'`（主）∪ 精确匹配的真机合成文本标记（次级证据，逐回合、整串精确匹配防误伤）∪ 既有 force-settle 兜底；黑盒测试钉住「含该词的正常正文不误判」与「标记不跨回合泄漏」。
 - **init 懒发（T7 live）**：`system/init` 随首个 stdin 输入之后到达（不在握手时），依赖 init 时序的逻辑要按此顺序设计。
 - **init frame 无版本字段（T7 live）**：`codebuddy_code_version` 在 2.187.0 的 init 帧缺席，bundled CLI 版本证据只能来自 verify-contract 的捆绑包断言。
-- **双 CLI 版本并存**：detect 报 PATH 全局 CLI（2.186.0），会话实际跑 SDK 捆绑 CLI（2.187.0）——两个版本号会同时出现在证据里，属预期形态。
+- **审批面板挂起项的 label 不随 /lang 即时切换（宿主面不支持——spec Story 23 仅部分达成）**：Story 23 原文——「作为中文或英文用户，我想 CodeBuddy 后端的用户可见文案跟随界面语言（/lang 即时切换生效），这样双语体验与宿主一致。」宿主 `capabilities.permissions` 面只有 `respond` + `pending()`（host-surface notes §3），`PermissionOptionView.label` 是普通字符串（notes §1），AgentEvent 词表没有「更新已挂起 permission.request」的事件（只有 request/settled 两种），第三方 bundle 也没有 kind:'key' 的渲染期解析机制（notes §5：key 是 in-tree 专属）。因此审批选项 label 只能在 park 时刻按当时 locale 烘焙：/lang 切换发生在面板挂起期间时，已挂起面板保持旧语言；下一次 park 即用新语言。会话其余全部用户可见文案（notices、拒绝理由、force-settle 警告等）都经 `localeOf(host)` 活读，切换即时生效。不硬造宿主没有的机制；等宿主扩词表后再跟进。
+- **双 CLI 版本并存（detect 已如实双报）**：detect 的 `version` 字段报 PATH 全局 CLI 实测值（2.186.0），同时以 `bundledCliVersion` + 双语 note 说明「会话实际运行 SDK 捆绑版 2.187.0（与 PATH 版本可能不同）」（code-review 修复，2026-11-26）；两个版本号同时出现在证据里属预期形态。
 - **交互 TUI 人工清单未跑**：headless 代理证据已齐（verify-assembly `offered:true` + live 会话证据 42/42），最后一环（重启 → picker → 真人对话）见 docs/live-checklist.md。
 
 ## Spec
 
 MVP 规格已发布到 issue tracker 并打上 `ready-for-agent`：[#1 Spec: CodeBuddy 后端 bundle MVP](https://github.com/SHYXIN/dsh-tui-backends/issues/1)。测试缝（已确认）：backend handler 导出面黑盒 + 假 CLI 桩（`CODEBUDDY_CODE_PATH` 注入）+ 上游装配链复用 + live 手工冒烟。
+
+## code-review 修复记录（2026-11-26，分支 fix/review-findings，基线 c62c2ac）
+
+Standards 轴：translator 两处英文兜底串入双语字典（`tool-failed`/`turn-error`）；prefs/settings 共享 JSON-store 脚手架提取为 store.js（分文件保留、只共享形状）；`localeOf` 统一从 text.js 导出、session 12 处文案全走活读的 `localeText`；删审批桥死参数 `cwd`；`touch` 依宿主契约（notes §2 BackendSessionPrefs 四动词原文）保留并注释。Spec 轴：`hook_blocked` → `turn.end{blocked,detail?}`（无 hooks 事件族，依据已注释；桩新增剧本线+黑盒）；interrupted 判定按 T7 真机校准为三线（terminal_reason ∪ 精确匹配合成标记 ∪ force-settle）；detect 如实双报两个 CLI 版本（`bundledCliVersion` + 双语 note，verify-assembly 断言同步 16→17）。审批 label 的 /lang 限制见上（宿主面不支持，不硬造）。
