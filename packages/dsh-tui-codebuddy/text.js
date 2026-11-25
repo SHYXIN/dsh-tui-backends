@@ -15,6 +15,13 @@ export const codebuddyTexts = {
     zh: '未找到 codebuddy CLI（PATH 上没有可执行文件）。请先安装：npm install -g @tencent-ai/codebuddy-code，或参考 https://www.codebuddy.ai/docs/cli/cli-reference',
     en: 'codebuddy CLI not found (nothing on PATH). Install it first: npm install -g @tencent-ai/codebuddy-code, or see https://www.codebuddy.ai/docs/cli/cli-reference',
   },
+  // detect's version honesty: detect.version stays the PATH CLI's measured
+  // value, but the session does NOT run that CLI — the SDK resolves its own
+  // bundled CLI first. The note spells out the difference, bilingually.
+  'detect-bundled-cli': {
+    zh: '会话实际运行 SDK 捆绑的 CLI v{{version}}（与 PATH 上的全局版本可能不同）。',
+    en: 'Sessions actually run the CLI bundled with the SDK, v{{version}} (it may differ from the PATH version).',
+  },
   'resume-invalid-target': {
     zh: 'CodeBuddy 会话恢复需要有效的会话 id（--resume <id>）。',
     en: 'CodeBuddy session resume needs a valid session id (--resume <id>).',

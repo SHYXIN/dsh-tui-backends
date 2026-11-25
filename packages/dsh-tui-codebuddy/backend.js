@@ -16,6 +16,7 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { codebuddyText, localeOf } from './text.js'
+import { VALIDATED_BUNDLED_CLI_VERSION } from './contract.js'
 import { createCodebuddySession } from './session.js'
 import { createCodebuddyPrefs } from './prefs.js'
 
@@ -106,13 +107,25 @@ async function readCliVersionByPathLookup() {
   return firstNonEmptyLine(stdout)
 }
 
-function detectResult(version) {
+/** The bundled-CLI fact (version honesty): detect's `version` field stays the
+ *  PATH CLI's measured value, but the session does NOT run that CLI — the SDK
+ *  resolves its own bundled CLI first (codebuddy-sdk notes §7.1), so the
+ *  detection carries the contract-pinned bundled version plus a bilingual
+ *  sentence spelling the difference out. Present on BOTH detect shapes. */
+function bundledFacts(locale) {
+  return {
+    bundledCliVersion: VALIDATED_BUNDLED_CLI_VERSION,
+    note: codebuddyText('detect-bundled-cli', locale, { version: VALIDATED_BUNDLED_CLI_VERSION }),
+  }
+}
+
+function detectResult(version, locale) {
   // The command exited 0, so the CLI is there; an odd build may print nothing.
-  return version === undefined ? { installed: true } : { installed: true, version }
+  return version === undefined ? { installed: true, ...bundledFacts(locale) } : { installed: true, version, ...bundledFacts(locale) }
 }
 
 function hintResult(locale) {
-  return { installed: false, hint: codebuddyText('hint-cli-missing', locale) }
+  return { installed: false, hint: codebuddyText('hint-cli-missing', locale), ...bundledFacts(locale) }
 }
 
 /** Detect the user-installed `codebuddy` CLI. Never throws: an unavailable
@@ -120,18 +133,19 @@ function hintResult(locale) {
  *  is the shared localeOf from text.js — the same helper session.js uses. */
 export async function detect(host) {
   try {
+    const locale = localeOf(host)
     if (process.platform === 'win32') {
       const resolved = await locateCliOnPath().catch(() => undefined)
       const version = resolved !== undefined
         ? await readCliVersion(resolved)
         : await readCliVersionByPathLookup()
-      return detectResult(version)
+      return detectResult(version, locale)
     }
     const { stdout } = await run(CLI_NAME, [VERSION_FLAG], {
       timeout: DETECT_TIMEOUT_MS,
       windowsHide: true,
     })
-    return detectResult(firstNonEmptyLine(stdout))
+    return detectResult(firstNonEmptyLine(stdout), locale)
   } catch {
     return hintResult(localeOf(host))
   }
