@@ -41,6 +41,24 @@ export const codebuddyTexts = {
     zh: '中断后超过 {{seconds}} 秒仍未收到 CLI 的 result，该回合已强制收口。',
     en: 'No result arrived within {{seconds}}s of the interrupt; the turn was force-settled.',
   },
+  'card-tail-dropped': {
+    zh: '（前 {{count}} 行已省略）',
+    en: '({{count}} earlier lines omitted)',
+  },
+  // Approval panel option labels (permission.request options); baked at park
+  // time in the live host locale.
+  'permission-allow-once': {
+    zh: '允许一次',
+    en: 'Allow once',
+  },
+  'permission-allow-always': {
+    zh: '始终允许',
+    en: 'Always allow',
+  },
+  'permission-reject': {
+    zh: '拒绝',
+    en: 'Deny',
+  },
 }
 
 /** Pick a text by locale and fill `{{name}}` params; an unknown locale/key

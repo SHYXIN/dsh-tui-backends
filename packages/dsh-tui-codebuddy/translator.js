@@ -21,6 +21,9 @@
  * frames. Anything this translator does not map returns [].
  */
 
+import { presentToolCall, presentToolResult } from './presentation.js'
+import { codebuddyText } from './text.js'
+
 const RESULT_ERROR_SUBTYPES = new Set(['error_during_execution', 'error_max_turns', 'error_max_budget_usd'])
 
 /**
@@ -113,8 +116,10 @@ class AssertionError extends Error {
  *   cwd: session working directory (fallback when init omits it)
  *   now: clock injection returning epoch ms
  *   debug: sink for ignored-frame diagnostics (opt-in host debug, never user-visible)
+ *   text: bilingual dict accessor `(key, params) => string`, pre-bound to the
+ *     live host locale by the session (direct translator use defaults to zh)
  */
-export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {} } = {}) {
+export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {}, text = (key, params) => codebuddyText(key, 'zh', params) } = {}) {
   const audit = createIdentityAudit()
 
   // ── identity-map state ──────────────────────────────────────────────────
@@ -126,6 +131,7 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
   let activeTurn = null // {number} while a turn is running
   const blockCalls = new Map() // stream content_block index → {callId, name, partialJson}
   const callLocation = new Map() // callId → {turn, step} recorded at tool.call
+  const callInputs = new Map() // callId → the model's input record, for the result card
   let readyEmitted = false
   let cumulativeUsage = null // session-cumulative tokens from the last result
 
@@ -354,6 +360,8 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
         const argsJson = JSON.stringify(block.input ?? {})
         const name = str(block.name) ?? ''
         callLocation.set(callId, { turn: attemptTurn, step: attemptStep })
+        if (block.input !== null && typeof block.input === 'object') callInputs.set(callId, block.input)
+        const presentation = presentToolCall(block.input, cwd)
         events.push({
           type: 'tool.call',
           seq: nextSeq(),
@@ -363,6 +371,7 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
           callId,
           name,
           argsJson,
+          ...(presentation !== undefined ? { presentation } : {}),
           time,
           ...(frame.parent_tool_use_id ? { parentCallId: str(frame.parent_tool_use_id) } : {}),
         })
@@ -401,8 +410,11 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
       if (block?.type !== 'tool_result') continue
       const callId = str(block.tool_use_id) ?? ''
       const location = callLocation.get(callId) ?? { turn: activeTurn.number, step }
-      const { content: raw, text } = toolResultContent(block.content)
+      const { content: raw, text: resultText } = toolResultContent(block.content)
       const isError = block.is_error === true
+      // The settled card (bounded run-output tail for command-shaped calls);
+      // the full text stays in the persistent record below.
+      const presentation = presentToolResult(callInputs.get(callId), { isError, text: resultText }, text)
       events.push({
         type: 'tool.result',
         seq: nextSeq(),
@@ -412,8 +424,9 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
         isError,
         time,
         content: raw,
-        text,
-        ...(isError ? { errorText: text !== '' ? text : 'tool failed' } : {}),
+        text: resultText,
+        ...(isError ? { errorText: resultText !== '' ? resultText : 'tool failed' } : {}),
+        ...(presentation !== undefined ? { presentation } : {}),
         ...(frame.parent_tool_use_id ? { parentCallId: str(frame.parent_tool_use_id) } : {}),
       })
     }

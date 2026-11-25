@@ -40,6 +40,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { createCodebuddyTranslator } from './translator.js'
+import { createCodebuddyPermissionBridge } from './permissions.js'
 import { codebuddyText } from './text.js'
 
 const BACKEND_ID = 'codebuddy'
@@ -148,20 +149,46 @@ export async function createCodebuddySession(target, host) {
   const { query } = await import('@tencent-ai/agent-sdk')
 
   const sessionKey = randomUUID()
-  const translator = createCodebuddyTranslator({ cwd, now: Date.now, debug })
+  const translator = createCodebuddyTranslator({
+    cwd,
+    now: Date.now,
+    debug,
+    // The card tail's dropped-lines marker is user-visible text — live locale.
+    text: (key, params) => codebuddyText(key, localeOf(host), params),
+  })
+
+  // The approval bridge (ticket T3): prompts park here and surface as
+  // permission.request / permission.settled; the answers become the
+  // PermissionResult the CLI expects. deliver/emit is hoisted, so the bridge
+  // can be built before the query that receives canUseTool.
+  const bridge = createCodebuddyPermissionBridge({
+    cwd,
+    emit: deliver,
+    debug,
+    locale: () => localeOf(host),
+    closing: () => disposed,
+    onPendingChange: count => {
+      if (disposed) return
+      // Parked prompts mean the session needs the user; settling them means
+      // back to running — but only while a turn is actually still open.
+      if (count > 0) setStatus('requires-action')
+      else if (turnActive) setStatus('running')
+    },
+  })
 
   // Options per the notes (§1): cwd; default permission mode (modes control is
   // T4); includePartialMessages to receive stream_event deltas; settingSources
   // untouched so the SDK sends `--setting-sources none` (full isolation from
   // filesystem settings); our session id up front so ref.sessionId is known at
-  // open time and the init frame echoes it back. No canUseTool yet — approvals
-  // are T3; a can_use_tool request without a handler is auto-denied by the SDK.
+  // open time and the init frame echoes it back. canUseTool is the approval
+  // bridge — without it the SDK auto-denies every can_use_tool request.
   const q = query({
     options: {
       cwd,
       sessionId: sessionKey,
       permissionMode: 'default',
       includePartialMessages: true,
+      canUseTool: bridge.canUseTool,
       stderr: data => {
         try {
           (host?.stderr ?? host?.debug)?.(data)
@@ -181,6 +208,7 @@ export async function createCodebuddySession(target, host) {
   let dead = false // transport died without dispose()
   let status = 'starting'
   let cliSessionId = null // authoritative id from the init frame
+  let turnActive = false // a turn is open (drives the requires-action return)
   const listeners = new Set()
   let backlog = [] // batches emitted before any subscriber
   const queue = [] // {clientMessageId, text, blocks, placement}
@@ -241,6 +269,7 @@ export async function createCodebuddySession(target, host) {
       blocks: item.blocks,
       clientMessageId: item.clientMessageId,
     })
+    turnActive = true
     deliver(events) // user.message + turn.start
     setStatus('running')
     // Write stdin AFTER the events are out so the channel sees the submit pair
@@ -268,10 +297,12 @@ export async function createCodebuddySession(target, host) {
    *  model/tool work is never killed by this clock. */
   function armInterruptSettle() {
     const ms = interruptSettleMs()
-    if (settleTimer !== null || disposed || status !== 'running' || ms === Number.POSITIVE_INFINITY) return
+    // turnActive covers 'running' AND 'requires-action' (an approval-stalled
+    // turn is just as interruptible — T3's state model).
+    if (settleTimer !== null || disposed || !turnActive || ms === Number.POSITIVE_INFINITY) return
     settleTimer = setTimeout(() => {
       settleTimer = null
-      if (disposed || status !== 'running') return
+      if (disposed || !turnActive) return
       // If the pump already closed the turn (dead transport path) there is
       // nothing left to settle and no notice to fabricate.
       const events = translator.abandonTurn({ kind: 'aborted' })
@@ -370,13 +401,17 @@ export async function createCodebuddySession(target, host) {
         try {
           const events = translator.translate(message)
           deliver(events)
-          if (!disposed && events.some(event => event.type === 'turn.end')) drainQueue()
+          if (events.some(event => event.type === 'turn.end')) {
+            turnActive = false
+            if (!disposed) drainQueue()
+          }
         } catch (error) {
           // A mapping/invariant bug must not kill the pump silently: localized
           // notice, synthesized error turn end, session stays alive.
           const detail = String(error?.message ?? error)
           debug(`translate failed: ${detail}`)
           deliver([{ type: 'notice', level: 'error', text: codebuddyText('internal-error-notice', localeOf(host), { detail }) }])
+          turnActive = false
           deliver(translator.abandonTurn({ kind: 'error', message: detail }))
           if (!disposed) drainQueue()
         }
@@ -384,12 +419,16 @@ export async function createCodebuddySession(target, host) {
       if (!disposed) {
         // stdout closed without dispose(): the CLI died under us.
         dead = true
+        turnActive = false
+        bridge.settleAll()
         deliver([failNotice('stream closed')])
         deliver(translator.abandonTurn({ kind: 'error', message: 'CLI process exited' }))
       }
     } catch (error) {
       if (!disposed) {
         dead = true
+        turnActive = false
+        bridge.settleAll()
         const detail = String(error?.message ?? error)
         deliver([failNotice(detail)])
         deliver(translator.abandonTurn({ kind: 'error', message: detail }))
@@ -412,7 +451,10 @@ export async function createCodebuddySession(target, host) {
       : `cb-${randomUUID()}`
     const kind = placement === 'steer' || placement === 'followup' || placement === 'now' ? placement : 'turn'
     const item = { clientMessageId, text, blocks: input?.blocks, placement: kind }
-    if (status === 'running') {
+    // turnActive (not `status === 'running'`): during 'requires-action' the
+    // current turn is stalled on an approval but still open — steer/followup
+    // must queue and `now` must interrupt it, same as any running turn.
+    if (turnActive) {
       if (kind === 'now') {
         // Four-semantics table (host-surface notes §2): `now` = 打断当前回合
         // 立即投递. SDK 0.3.307's streamInput has no priority channel (claude's
@@ -424,8 +466,11 @@ export async function createCodebuddySession(target, host) {
         // turn numbering monotonic for the channel (no interleaved turn
         // ends). If the CLI never answers the interrupt, the force-settle
         // backstop closes the turn and drainQueue starts this input anyway —
-        // the urgent message is never lost to a hung CLI.
+        // the urgent message is never lost to a hung CLI. Interrupting an
+        // approval-stalled turn also withdraws the panel (zero parked prompts
+        // make settleAll a no-op).
         sendInterrupt()
+        bridge.settleAll()
         queue.unshift(item)
       } else {
         // steer/followup: join the queue behind whatever is waiting. With
@@ -462,8 +507,13 @@ export async function createCodebuddySession(target, host) {
       // interrupt 还要求丢弃队列输入（notes §2）：dropped:true 让 channel 把
       // 文本保留成 held row 供用户重发。
       for (const item of queue.splice(0)) debug(`dropped queued input ${item.clientMessageId} (cancel ${cause})`)
+      // 离开即撤回挂起审批（T3 面板不悬挂）：SDK 0.3.307 的 abort 信号不会因
+      // 这条自造 interrupt 触发，桥自己收口， settled 事件先进 channel。
+      bridge.settleAll()
     }
-    const running = status === 'running'
+    // 回合在飞（T3 语义：审批挂起 requires-action 也算——interrupt 同样要
+    // 收掉它，settleAll 已在上面收口审批面板）。
+    const running = turnActive
     const sent = running ? sendInterrupt() : undefined
     syncPending(leaving && hadPending ? { dropped: true } : {})
     return {
@@ -487,7 +537,11 @@ export async function createCodebuddySession(target, host) {
       // Synthesize the running turn's end locally — the CLI will never send a
       // result for it now. Delivered BEFORE the transport closes so the
       // channel sees the turn end.
+      turnActive = false
       deliver(translator.abandonTurn({ kind: 'aborted', cause: 'disposed' }))
+      // Pending approvals settle (cancelled) BEFORE the query closes so the
+      // settled events reach the channel and the panel never hangs.
+      bridge.settleAll()
       inbox.close()
       try {
         // stdin EOF lets the CLI run its own graceful shutdown (the SDK keeps
@@ -539,8 +593,14 @@ export async function createCodebuddySession(target, host) {
     get status() {
       return status
     },
-    // 每个成员缺席＝明确"不支持"（notes §3）；permissions 能力 T3 接入后加入。
-    capabilities: {},
+    // 每个成员缺席＝明确"不支持"（notes §3）；permissions 是 T3 的审批能力：
+    // respond 把面板决策送回 CLI，pending 列出仍挂起的请求（重开面板用）。
+    capabilities: {
+      permissions: {
+        respond: bridge.respond,
+        pending: () => bridge.pendingViews(),
+      },
+    },
     history,
     subscribe,
     submit,
