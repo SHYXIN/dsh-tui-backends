@@ -8,7 +8,7 @@
 | 可行性 | ✅ Claude 形态；调研见 research-notes.md |
 | 交付形态 | **第三方 bundle**：独立 npm 包，不动上游仓库 |
 | MVP 范围 | 核心闭环五件事（见下） |
-| 达成标准 | 本地装进 profile → 重启 → 内核选择器出现 CodeBuddy → 能实际对话；**npm 发版不做** |
+| 达成标准 | 本地装进 profile → 重启 → 内核选择器出现 CodeBuddy → 能实际对话；**npm 发版不做** ✅（2026-11-26 达成，见 live-evidence.md） |
 
 ## MVP 核心闭环（五件事）
 
@@ -28,20 +28,42 @@
 
 ## 下一步（按序）
 
-1. [ ] 精读 `src/agent/` 公开面（events.ts / session.ts / capabilities.ts / backend.ts）与 Claude 后端 session/translate 实现
-2. [ ] 实现 `AgentBackend.open`：SDK `query()` 组装（options 钉权限模式、settingSources 策略）
-3. [ ] 实现 `AgentSession`：subscribe/submit/cancel/dispose + canUseTool → 审批事件
-4. [ ] 翻译器 + 双语文案 text.ts
-5. [ ] `scripts/verify-backend-assembly.ts` 跑通装链路（一次性 profile）
-6. [ ] 真机验证：装进本机 profile → 重启 dsh-TUI → picker 出现 CodeBuddy → 真实对话
-7. [ ] （可选）向上游提 issue/PR 前先跑通以上全部
+1. [x] 精读 `src/agent/` 公开面（events.ts / session.ts / capabilities.ts / backend.ts）与 Claude 后端 session/translate 实现
+2. [x] 实现 `AgentBackend.open`：SDK `query()` 组装（options 钉权限模式、settingSources 策略）
+3. [x] 实现 `AgentSession`：subscribe/submit/cancel/dispose + canUseTool → 审批事件
+4. [x] 翻译器 + 双语文案 text.ts
+5. [x] `scripts/verify-backend-assembly.ts` 跑通装链路（一次性 profile）
+6. [x] 真机验证：装进本机 profile → 重启 dsh-TUI → picker 出现 CodeBuddy → 真实对话
+7. [ ] （可选）向上游提 issue/PR 前先跑通以上全部——前置已全部跑通，本项未做
 
 ## 环境基线
 
 - dsh-TUI clone：`b110b240`（main）
-- codebuddy CLI：v2.186.0（`codebuddy.ps1` 经 nvm4w 全局）
+- codebuddy CLI：v2.186.0（`codebuddy.ps1` 经 nvm4w 全局）；SDK 捆绑 CLI v2.187.0（会话实际运行，见 contract.js）
 - Node v24.14.0 / pnpm 11.21.0
 - gh 认证：keyring（SHYXIN）
+
+## 遗留项（MVP 收尾后仍开放的事，2026-11-26）
+
+### 未声明能力（界面诚实显示「当前后端不支持」）
+
+子代理 / tasks / fork / rewind / effort / compact 等一律未声明——每加一项 = 多声明一个 capability + 多翻译几类事件。`usage_update` 之外的 `status` / `task_*` / `file-history-snapshot` 等帧仍被翻译器有意忽略（不会坏，只是没有界面）。
+
+### SDK Unstable 面（钉版 0.3.307 下的既知依赖）
+
+- **one-shot query 绕行（T2）**：`query()` 自身的异步迭代器是一次性的（首个 result 即收尾），会话直接消费 `q.transport.messages()` 维持长寿命读循环——session.js 头注明确标注的唯一 reach-through。
+- **模型切换 transport 直通（T6）**：`q.setModel()` 只在 SDK 自己的读迭代器里生效（`_sessionId` 由它捕获，本会话刻意绕开），所以 set_model 走 `q.transport.sendControlRequest` 直发；ack 是送达证据，CLI 是否接受不可观测。
+- **credits custom 逃生口（T6）**：credits 没有宿主原生槽位，经 `codebuddy.turn-usage` custom 事件暴露；token 只经 `assistant.message.usage` 记账，两套数字不重复累加（translator.js anti-double-add）。
+- **僵尸 CLI 防御（T4）**：interrupt 无回合级回执——15s force-settle 兜底 + dead transport 守卫（SDK sendControlRequest 的 auto-start 脚枪不会复活死 CLI）；cancel 语义诚实（running=unknown / idle=confirmed / dead=failed）。
+
+### known limitations（含 T7 真机 live 发现，证据见 live-evidence.md）
+
+- **回放 settle 策略（T5 + T7 live）**：真机 `--resume` 回放不含逐回合 result 帧——历史回合在种子中悬垂，只有最后一个回合带真实 result；`settleReplay()` 仅在仍有悬垂回合时合成收口（T5 的 fake-CLI 模型与真机不同）。编号连续性不受影响；种子 turn.end 不完整是既知形态，后续按真机证据校准。
+- **流式中断无 terminal_reason（T7 live）**：bundled 2.187.0 流式取消路径的 result 不携带 `terminal_reason`（CLI 源码无 `'interrupt'` 值；abort 路径是 `aborted_streaming`/`aborted_tools`），真机中断信号 = CLI 合成的 "Interrupted by user" 助手消息 + `turn.end{completed}`。翻译器的 `interrupted` 判定在真机流式路径不命中——中断收口本身不受影响，需后续票校准。
+- **init 懒发（T7 live）**：`system/init` 随首个 stdin 输入之后到达（不在握手时），依赖 init 时序的逻辑要按此顺序设计。
+- **init frame 无版本字段（T7 live）**：`codebuddy_code_version` 在 2.187.0 的 init 帧缺席，bundled CLI 版本证据只能来自 verify-contract 的捆绑包断言。
+- **双 CLI 版本并存**：detect 报 PATH 全局 CLI（2.186.0），会话实际跑 SDK 捆绑 CLI（2.187.0）——两个版本号会同时出现在证据里，属预期形态。
+- **交互 TUI 人工清单未跑**：headless 代理证据已齐（verify-assembly `offered:true` + live 会话证据 42/42），最后一环（重启 → picker → 真人对话）见 docs/live-checklist.md。
 
 ## Spec
 

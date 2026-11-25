@@ -8,14 +8,25 @@
 
 | 包 | 状态 | 说明 |
 | --- | --- | --- |
-| [`packages/dsh-tui-codebuddy`](packages/dsh-tui-codebuddy) | 🚧 脚手架（2026-11-25） | CodeBuddy 后端：声明 + detect 已就位，会话实现（MVP）未开始 |
+| [`packages/dsh-tui-codebuddy`](packages/dsh-tui-codebuddy) | ✅ MVP 达成（2026-11-26） | CodeBuddy 后端：对话 / 审批 / 中断 / 恢复真机跑通（live 冒烟 42/42），遗留项见 docs/decisions.md |
+
+## MVP 状态（2026-11-26）
+
+CodeBuddy 后端 MVP 四件事（对话 / 审批 / 中断 / 恢复）已在真机（真实 CLI + 已登录账号）跑通：
+
+- `pnpm test` 90/90 · 装配链 16/16（picker `offered:true`）· 契约门 25/25
+- live 冒烟 42/42：提示词全部最小化，事件证据与用量数字见 [docs/live-evidence.md](docs/live-evidence.md)
+- 交互 TUI 的最后一环（重启 → picker → 真人对话）走人工清单：[docs/live-checklist.md](docs/live-checklist.md)
+- 已知偏离与遗留项集中在 [docs/decisions.md](docs/decisions.md) 的「遗留项」节
 
 > dsh-TUI 约束：**一个 bundle 包只能声明一个后端**，所以每个后端是 `packages/` 下独立的 npm 包；仓库层面用 pnpm workspace 收拢。
 
 ## 文档
 
 - [docs/research-notes.md](docs/research-notes.md) — CodeBuddy 接入可行性调研（事实与来源）
-- [docs/decisions.md](docs/decisions.md) — 设计共识、MVP 范围、验收标准与下一步
+- [docs/decisions.md](docs/decisions.md) — 设计共识、MVP 范围、验收标准、下一步与遗留项
+- [docs/live-evidence.md](docs/live-evidence.md) — T7 真机 live 冒烟证据（平台 / CLI 版本 / 事件证据 / 用量 / 偏离）
+- [docs/live-checklist.md](docs/live-checklist.md) — 交互 TUI 人工验收清单（重启 → picker → 真人对话）
 
 ## 结构
 
