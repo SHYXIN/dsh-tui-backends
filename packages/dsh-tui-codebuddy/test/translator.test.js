@@ -8,8 +8,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createCodebuddyTranslator, createIdentityAudit } from '../translator.js'
+import { codebuddyText } from '../text.js'
 
 const NOW = () => 1_700_000_000_000
+const enText = (key, params) => codebuddyText(key, 'en', params)
 
 /** The canonical init frame a CodeBuddy CLI emits on stream-json startup. */
 function initFrame(overrides = {}) {
@@ -284,6 +286,36 @@ test('a failed tool result carries errorText; error subtypes end the turn with k
   })))
   const end = events.find(e => e.type === 'turn.end')
   assert.deepEqual(end.reason, { kind: 'error', message: 'CLI exploded' })
+  createIdentityAudit().check(events)
+})
+
+test('bare error payloads fall back to the bilingual dict, never a hardcoded literal', () => {
+  // Empty error text on a failed tool_result → the dict's tool-failed marker
+  // in the accessor's language (the session binds it to the live locale).
+  const en = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW, text: enText })
+  en.translate(initFrame())
+  const events = [...en.userSubmitted({ text: 'run', clientMessageId: 'u1' })]
+  events.push(...en.translate({
+    type: 'assistant', uuid: 'u-0002', session_id: 's', parent_tool_use_id: null,
+    message: { id: 'msg_1', type: 'message', role: 'assistant', model: 'stub-model',
+      content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} }],
+      stop_reason: 'tool_use', stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } },
+  }))
+  events.push(...en.translate({
+    type: 'user', uuid: 'u-0003', session_id: 's', parent_tool_use_id: 'toolu_1',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: '', is_error: true }] },
+  }))
+  assert.equal(events.find(e => e.type === 'tool.result').errorText, 'Tool failed')
+
+  // A result subtype the error family without an errors[] payload and without
+  // even a subtype string → the dict's turn-error marker.
+  const zh = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  zh.translate(initFrame())
+  zh.userSubmitted({ text: 'run', clientMessageId: 'u1' })
+  const zhEvents = zh.translate({ type: 'result', is_error: true })
+  assert.deepEqual(zhEvents.find(e => e.type === 'turn.end').reason, { kind: 'error', message: '执行出错' })
+  const enEvents = en.translate({ type: 'result', is_error: true })
+  assert.deepEqual(enEvents.find(e => e.type === 'turn.end').reason, { kind: 'error', message: 'An error occurred' })
   createIdentityAudit().check(events)
 })
 

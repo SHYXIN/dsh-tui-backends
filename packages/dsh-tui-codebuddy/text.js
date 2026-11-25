@@ -47,6 +47,17 @@ export const codebuddyTexts = {
     zh: '中断后超过 {{seconds}} 秒仍未收到 CLI 的 result，该回合已强制收口。',
     en: 'No result arrived within {{seconds}}s of the interrupt; the turn was force-settled.',
   },
+  // Translator fallbacks for error payloads that carry no text of their own
+  // (a failed tool_result with empty content; a turn-ending result with no
+  // subtype string). Picked in the translator's bound locale, never hardcoded.
+  'tool-failed': {
+    zh: '工具执行失败',
+    en: 'Tool failed',
+  },
+  'turn-error': {
+    zh: '执行出错',
+    en: 'An error occurred',
+  },
   'card-tail-dropped': {
     zh: '（前 {{count}} 行已省略）',
     en: { one: '({{count}} earlier line omitted)', other: '({{count}} earlier lines omitted)' },

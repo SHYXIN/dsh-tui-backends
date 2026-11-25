@@ -524,7 +524,7 @@ export function createCodebuddyTranslator({
         time,
         content: raw,
         text: resultText,
-        ...(isError ? { errorText: resultText !== '' ? resultText : 'tool failed' } : {}),
+        ...(isError ? { errorText: resultText !== '' ? resultText : text('tool-failed') } : {}),
         ...(presentation !== undefined ? { presentation } : {}),
         ...(frame.parent_tool_use_id ? { parentCallId: str(frame.parent_tool_use_id) } : {}),
       })
@@ -643,7 +643,7 @@ export function createCodebuddyTranslator({
   function turnEndReason(frame) {
     if (RESULT_ERROR_SUBTYPES.has(frame.subtype) || frame.is_error === true) {
       const errors = Array.isArray(frame.errors) ? frame.errors.filter(e => typeof e === 'string') : []
-      return { kind: 'error', message: errors.join('; ') || str(frame.subtype) || 'error' }
+      return { kind: 'error', message: errors.join('; ') || str(frame.subtype) || text('turn-error') }
     }
     const terminal = str(frame.terminal_reason)
     if (terminal === 'interrupt') return { kind: 'interrupted' }
