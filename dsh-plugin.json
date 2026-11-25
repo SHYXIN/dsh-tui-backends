@@ -1,0 +1,47 @@
+{
+  "$schema": "urn:dsh-std:community-draft:dsh-plugin:0.15",
+  "manifestVersion": "0.15",
+  "id": "io.github.shyxin.dsh-tui-codebuddy",
+  "name": "dsh-tui-codebuddy",
+  "version": "0.0.1",
+  "facets": {
+    "host": {
+      "entry": "backend.js",
+      "apiVersion": "v1alpha1"
+    }
+  },
+  "requires": {
+    "contracts": []
+  },
+  "permissions": [],
+  "contributes": {
+    "commands": [],
+    "x-dsh-tui": [
+      {
+        "apiVersion": "tui.dsh/v1alpha1",
+        "kind": "Backend",
+        "id": "io.github.shyxin.dsh-tui-codebuddy",
+        "name": "codebuddy_backend",
+        "spec": {
+          "id": "codebuddy",
+          "label": {
+            "text": "CodeBuddy"
+          },
+          "shortLabel": "CBC",
+          "product": "codebuddy",
+          "capabilities": [
+            "permissions",
+            "models",
+            "images"
+          ],
+          "grants": []
+        }
+      }
+    ]
+  },
+  "subscriptions": [],
+  "license": "MIT",
+  "source": {
+    "repository": "https://github.com/SHYXIN/dsh-tui-codebuddy"
+  }
+}
