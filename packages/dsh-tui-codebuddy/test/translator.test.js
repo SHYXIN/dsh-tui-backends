@@ -297,6 +297,26 @@ test('an interrupted result (success subtype + terminal_reason) ends the turn in
   createIdentityAudit().check(events)
 })
 
+test('terminal_reason variants: end_turn/absent complete, unknown values stay visible as other', () => {
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator.translate(initFrame())
+  // Natural completion states the CLI's EXIT_REASONS value for a finished turn.
+  let events = [...translator.userSubmitted({ text: 'hi', clientMessageId: 'u1' })]
+  events.push(...translator.translate(resultFrame({ terminal_reason: 'end_turn' })))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'completed' })
+
+  // An older CLI may omit the runtime-only field entirely — still a completion.
+  events = [...translator.userSubmitted({ text: 'again', clientMessageId: 'u2' })]
+  events.push(...translator.translate(resultFrame()))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'completed' })
+
+  // A reason outside the mapped set (e.g. user_exit from the CLI's
+  // EXIT_REASONS tuple) must not masquerade as 'completed' — surface it.
+  events = [...translator.userSubmitted({ text: 'third', clientMessageId: 'u3' })]
+  events.push(...translator.translate(resultFrame({ terminal_reason: 'user_exit' })))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'other', label: 'user_exit' })
+})
+
 test('streaming tool-args deltas carry the partial JSON attributed to the callId', () => {
   const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
   translator.translate(initFrame())

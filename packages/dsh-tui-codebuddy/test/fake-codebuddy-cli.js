@@ -12,24 +12,40 @@
  *
  * Environment:
  *   CB_FAKE_SCRIPT      scenario JSON path (optional; default = echo turns)
- *   CB_FAKE_MARKER_DIR  dir receiving `stub-start-<pid>` / `stub-exit-<pid>`
- *                       marker files, the explicit no-dangling-handle evidence,
- *                       plus `stub-perm-responses.jsonl` — every can_use_tool
+ *   CB_FAKE_MARKER_DIR  dir receiving `stub-start-<pid>` / `stub-exit-<pid>` /
+ *                       `stub-interrupt-<pid>` marker files (no-dangling-handle
+ *                       + signal-arrival evidence) plus
+ *                       `stub-perm-responses.jsonl` — every can_use_tool
  *                       control_response the stub received, the black-box
  *                       record of what the SDK answered on the wire
  *
  * Scenario shape:
  *   { "sessionId"?: string, "model"?: string,
+ *     "exitAfterFirstUser"?: boolean,             // die mid-turn, never result
  *     "afterInit"?: Frame[],                       // emitted once after init
  *     "turns"?: [{ "frames"?: Frame[],             // emitted on the Nth user message
- *                 "resultDelayMs"?: number }] }    // delay before the default result
+ *                 "resultDelayMs"?: number,        // delay before the default result
+ *                 "interruptResult"?: 'none' }] }  // ack interrupt, never emit result
  * Frames are written verbatim; `uuid` / `session_id` are default-filled.
+ *
  * One frame kind is intercepted instead of written:
  *   { "type": "_permission_gate", "toolUseId", "toolName", "input",
  *     "resultText"? } — emits the tool_use assistant frame, then a real
  *   can_use_tool control request, and holds the script until the SDK's
  *   control_response arrives (allowed → the tool result; denied → an error
  *   tool result carrying the reason, like a CLI reporting a refusal).
+ *
+ * Interrupt lines (ticket T4):
+ *  - default: an interrupt control request arriving mid-run cancels the
+ *    pending delayed result and emits the interrupted-form result EARLY —
+ *    subtype:'success', is_error:false, terminal_reason:'interrupt',
+ *    result:'' (the shape the docs promise for a cancelled turn);
+ *  - `interruptResult:'none'`: the interrupt is ACKNOWLEDGED (control
+ *    response, like the real CLI) but no result ever follows — the
+ *    "CLI never replies with a result" line that exercises the session's
+ *    force-settle backstop;
+ *  - every interrupt writes the `stub-interrupt-<pid>` marker FIRST, so tests
+ *    can prove the signal physically reached the CLI process.
  */
 import readline from 'node:readline'
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
@@ -99,10 +115,22 @@ let cumulativeInput = 0
 let cumulativeOutput = 0
 let turnOpen = false
 let resultTimer = null
+let currentScript = null // the scenario script of the turn in flight
+let userTurnsSeen = 0
 const turnDenials = []
 let permissionSeq = 0
 const pendingGates = new Map() // request_id → { toolUseId, toolName, input }
 const pendingGateWaits = new Map() // request_id → resolve() of the parked script
+
+/** A bare assistant frame (no result) — used by the die-mid-turn line. */
+function assistantFrameOnly(text) {
+  out({
+    type: 'assistant', parent_tool_use_id: null,
+    message: { id: `msg_${uuidCounter + 1}`, type: 'message', role: 'assistant', model,
+      content: [{ type: 'text', text }], stop_reason: 'end_turn', stop_sequence: null,
+      usage: { input_tokens: 10, output_tokens: 5 } },
+  })
+}
 
 function recordPermissionResponse(requestId, gate, response) {
   if (!markerDir) return
@@ -238,7 +266,17 @@ async function emitScriptTurn(script) {
 
 function startTurn(userText) {
   turnOpen = true
+  userTurnsSeen += 1
+  if (scenario.exitAfterFirstUser === true && userTurnsSeen === 1) {
+    // "CLI dies mid-turn" line: one assistant frame proves the turn was in
+    // flight, then the process exits without ever emitting a result.
+    assistantFrameOnly('dying mid-turn')
+    mark('exit')
+    setTimeout(() => process.exit(0), 30) // let the stdout write flush first
+    return
+  }
   const script = (scenario.turns ?? []).shift()
+  currentScript = script
   if (script === undefined) return emitEchoTurn(userText)
   emitScriptTurn(script).catch(() => {
     // a broken scenario must not crash the stub process; the test times out
@@ -264,11 +302,19 @@ function handleControlRequest(line) {
         },
       })
       break
-    case 'interrupt':
+    case 'interrupt': {
+      // Evidence first: the interrupt signal physically reached the CLI.
+      mark('interrupt')
+      // The real CLI acks the interrupt control request; the RESULT frame is
+      // the only turn-level receipt there is — an ack must never be read as
+      // one by the session (T4 receipt semantics).
+      out({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response: {} } })
+      if (currentScript?.interruptResult === 'none') break // never replies — backstop line
       if (resultTimer !== null) clearTimeout(resultTimer)
       resultTimer = null
       if (turnOpen) defaultResult({ frame: { terminal_reason: 'interrupt', result: '' } })
       break
+    }
     default:
       // set_permission_mode / set_model / mcp_status / …: success, empty payload
       out({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response: {} } })

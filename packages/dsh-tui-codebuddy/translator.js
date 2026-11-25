@@ -471,16 +471,38 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
     }]
   }
 
-  /** `result` → TurnEndReason. CodeBuddy has no 'interrupted' subtype: an
-   *  interrupted turn still ends as subtype:'success' with a runtime-only
-   *  `terminal_reason` field (notes §2.2). */
+  /**
+   * `result` → TurnEndReason. Determination basis for the "interrupt is also a
+   * success" shape (T4, notes codebuddy-sdk §2.2 + §8, host-surface §1):
+   *
+   * The result subtype union has NO 'interrupted'/'hook_blocked' member —
+   * a user interrupt still ends the turn as
+   *   { type:'result', subtype:'success', is_error:false,
+   *     terminal_reason:'interrupt', result:'' }   // result '' when nothing
+   *                                                // had completed yet
+   * `terminal_reason` is a runtime-only field (absent from the 0.3.307 .d.ts)
+   * whose values come from the CLI's EXIT_REASONS tuple
+   * ('user_exit'|'interrupt'|'error'|'end_turn'|'max_turns'|'max_budget_usd');
+   * the error exits arrive as the error_* subtypes above, so here only the
+   * success family is left to split:
+   *   - terminal_reason 'interrupt'  → { kind:'interrupted' }  (Esc/cancel)
+   *   - 'end_turn' or field absent   → { kind:'completed' }    (older CLIs may
+   *     omit the runtime field entirely; absence must not read as a hang)
+   *   - anything else                → { kind:'other', label } — an unknown
+   *     CLI reason stays visible instead of masquerading as a completion.
+   * The empty `result` string of an interrupted turn is a secondary hint, NOT
+   * a test: a legitimately terse completion may also be short, so only the
+   * explicit terminal_reason decides.
+   */
   function turnEndReason(frame) {
     if (RESULT_ERROR_SUBTYPES.has(frame.subtype) || frame.is_error === true) {
       const errors = Array.isArray(frame.errors) ? frame.errors.filter(e => typeof e === 'string') : []
       return { kind: 'error', message: errors.join('; ') || str(frame.subtype) || 'error' }
     }
-    if (str(frame.terminal_reason) === 'interrupt') return { kind: 'interrupted' }
-    return { kind: 'completed' }
+    const terminal = str(frame.terminal_reason)
+    if (terminal === 'interrupt') return { kind: 'interrupted' }
+    if (terminal === undefined || terminal === 'end_turn') return { kind: 'completed' }
+    return { kind: 'other', label: terminal }
   }
 
   /** result.usage is session-cumulative; turn.end.usage wants the per-turn

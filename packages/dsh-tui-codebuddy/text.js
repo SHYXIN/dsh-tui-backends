@@ -37,6 +37,10 @@ export const codebuddyTexts = {
     zh: 'CodeBuddy 后端内部错误：{{detail}}',
     en: 'CodeBuddy backend internal error: {{detail}}',
   },
+  'interrupt-forced-notice': {
+    zh: '中断后超过 {{seconds}} 秒仍未收到 CLI 的 result，该回合已强制收口。',
+    en: 'No result arrived within {{seconds}}s of the interrupt; the turn was force-settled.',
+  },
   'card-tail-dropped': {
     zh: '（前 {{count}} 行已省略）',
     en: '({{count}} earlier lines omitted)',
