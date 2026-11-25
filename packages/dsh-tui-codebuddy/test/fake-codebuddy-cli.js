@@ -17,7 +17,13 @@
  *                       + signal-arrival evidence) plus
  *                       `stub-perm-responses.jsonl` — every can_use_tool
  *                       control_response the stub received, the black-box
- *                       record of what the SDK answered on the wire
+ *                       record of what the SDK answered on the wire; plus
+ *                       `stub-argv-<pid>.json` — the CLI argv the SDK passed
+ *                       (--model persistence evidence, T6);
+ *                       `stub-model-requests.jsonl` — every set_model control
+ *                       request that reached the CLI (T6);
+ *                       `stub-user-messages.jsonl` — every user-message
+ *                       payload as it arrived on stdin (images block shape, T6)
  *
  * Scenario shape:
  *   { "sessionId"?: string, "model"?: string,
@@ -72,6 +78,26 @@ function mark(kind, code) {
   } catch {
     // evidence is best-effort; never break the stub over it
   }
+}
+
+/** Append one JSON line to an evidence file (T6): the black-box record of
+ *  what actually reached the CLI — set_model control requests, and the full
+ *  user-message payloads as they arrived on stdin. */
+function appendEvidence(name, record) {
+  if (!markerDir) return
+  try {
+    appendFileSync(join(markerDir, name), `${JSON.stringify(record)}\n`)
+  } catch {
+    // evidence is best-effort; never break the stub over it
+  }
+}
+
+// T6: the spawn argv — proof of which CLI flags the SDK actually passed
+// (`--model <id>` persistence lands here). One file per process.
+try {
+  if (markerDir) writeFileSync(join(markerDir, `stub-argv-${process.pid}.json`), JSON.stringify({ argv: process.argv.slice(2) }))
+} catch {
+  // evidence is best-effort
 }
 
 let scenario = {}
@@ -371,11 +397,20 @@ function handleControlRequest(line) {
           request_id: requestId,
           response: {
             commands: [],
-            models: [{ value: model, displayName: 'Stub model', description: '' }],
+            // T6: the scenario can script a richer model list for the
+            // models-capability tests; the default stays the single model.
+            models: Array.isArray(scenario.models) && scenario.models.length > 0
+              ? scenario.models
+              : [{ value: model, displayName: 'Stub model', description: '' }],
             account: {},
           },
         },
       })
+      break
+    case 'set_model':
+      // T6 evidence: the model switch control request physically reached the CLI.
+      appendEvidence('stub-model-requests.jsonl', { subtype: 'set_model', model: request.model, session_id: request.session_id })
+      out({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response: {} } })
       break
     case 'interrupt': {
       // Evidence first: the interrupt signal physically reached the CLI.
@@ -413,6 +448,9 @@ rl.on('line', raw => {
     return
   }
   if (line.type === 'user') {
+    // T6 evidence: the full user-message payload as it arrived on stdin —
+    // the black-box record the images-capability tests assert against.
+    appendEvidence('stub-user-messages.jsonl', { content: line.message?.content })
     const content = line.message?.content
     const text = typeof content === 'string' ? content : '(blocks)'
     void startTurn(text) // the script may park on a permission gate

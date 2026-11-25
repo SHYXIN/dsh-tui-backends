@@ -17,6 +17,16 @@
  * (spawn + initialize handshake), `streamInput()` for stdin writes.
  *
  * Session semantics:
+ * - capabilities: the manifest declares permissions / models / images and the
+ *   runtime provides exactly those three (test/capabilities.test.js pins the
+ *   equality; ticket T6). models drives the SDK's supportedModels() +
+ *   a direct set_model control request (see the capability below); images
+ *   declares the composer limits and submit() maps AgentInput.images onto
+ *   base64 image blocks (images.js);
+ * - usage accounting (T6): usage_update frames surface credits through
+ *   `custom` events (translator.js) while tokens book ONLY through
+ *   assistant.message.usage — the turn-level and session-cumulative number
+ *   families never double-add;
  * - subscribe: batch delivery with backlog replay for late subscribers
  *   (notes §2 convention);
  * - submit/placement: `turn` opens a turn when idle, FIFO-queues when busy;
@@ -41,7 +51,9 @@
 import { randomUUID } from 'node:crypto'
 import { createCodebuddyTranslator } from './translator.js'
 import { createCodebuddyPrefs } from './prefs.js'
+import { createCodebuddySettings } from './settings.js'
 import { createCodebuddyPermissionBridge } from './permissions.js'
+import { CODEBUDDY_IMAGE_LIMITS, codebuddyImageBlocks } from './images.js'
 import { codebuddyText } from './text.js'
 
 const BACKEND_ID = 'codebuddy'
@@ -51,6 +63,14 @@ const BACKEND_ID = 'codebuddy'
 // 10s means the CLI is effectively gone — the session-level force-settle
 // backstop (below) owns the turn from there.
 const INTERRUPT_ACK_TIMEOUT_MS = 10_000
+
+// Ack window for the set_model control request (ticket T6). Same scale and
+// rationale as the interrupt window: a CLI that cannot ack a model switch
+// within 10s is effectively gone. The ack is DELIVERY evidence — SDK 0.3.307
+// exposes no "model accepted" receipt (q.setModel is fire-and-forget with a
+// swallowed rejection, query.js), so `switched` honestly means "the switch
+// reached the CLI and was acked", nothing stronger.
+const MODEL_ACK_TIMEOUT_MS = 10_000
 
 // Force-settle backstop for an interrupt the CLI never answers with a result
 // (ticket T4: 不永久悬挂). Calibrated between the notes' reference durations:
@@ -155,6 +175,15 @@ export async function createCodebuddySession(target, host) {
   // store; the session records the CLI-confirmed session id the moment the
   // init frame confirms it. No dataDir → in-memory per host (never guessed).
   const prefs = createCodebuddyPrefs(host)
+  // The model-choice memory (T6): the persisted `/model` selection applies to
+  // the NEXT session open (host semantics: 设置改动作用于下一请求 — the closest
+  // equivalent at open time); the live session additionally switches in
+  // place through models.set (see the capability below).
+  const settings = createCodebuddySettings(host)
+  const savedModel = settings.model()
+  // The bilingual accessor bound to the LIVE host locale — one instance for
+  // the translator, image refusals, notices and refusal reasons alike.
+  const localeText = (key, params) => codebuddyText(key, localeOf(host), params)
 
   // Lazy SDK import: the bundle module itself must stay side-effect-free and
   // light (the Loader imports it before detect/open); the SDK is only loaded
@@ -172,7 +201,7 @@ export async function createCodebuddySession(target, host) {
     debug,
     replay: isResume,
     // The card tail's dropped-lines marker is user-visible text — live locale.
-    text: (key, params) => codebuddyText(key, localeOf(host), params),
+    text: localeText,
   })
 
   // The approval bridge (ticket T3): prompts park here and surface as
@@ -223,6 +252,10 @@ export async function createCodebuddySession(target, host) {
       options: {
         cwd,
         ...(isResume ? { resume: sessionKey } : { sessionId: sessionKey }),
+        // The persisted /model choice (T6): applied to every session open —
+        // `--model <id>` (Options.model, SDK §1) — so the selection survives
+        // restarts. A session without a choice lets the CLI pick its default.
+        ...(savedModel !== undefined ? { model: savedModel } : {}),
         permissionMode: 'default',
         includePartialMessages: true,
         canUseTool: bridge.canUseTool,
@@ -266,6 +299,7 @@ export async function createCodebuddySession(target, host) {
   let dead = false // transport died without dispose()
   let status = 'starting'
   let cliSessionId = null // authoritative id from the init frame
+  let currentModel = null // the active model, from the init frame then models.set
   let turnActive = false // a turn is open (drives the requires-action return)
   const listeners = new Set()
   let backlog = [] // batches emitted before any subscriber
@@ -299,6 +333,11 @@ export async function createCodebuddySession(target, host) {
         } catch (error) {
           debug(`lastSession recording failed: ${error?.message}`)
         }
+      }
+      // The CLI's own model report (init frame) is the first truth for
+      // models.current(); models.set() overrides it from there.
+      if (event.type === 'session.ready' && typeof event.model === 'string' && event.model !== '' && currentModel === null) {
+        currentModel = event.model
       }
     }
     if (translator.replayActive()) {
@@ -362,6 +401,7 @@ export async function createCodebuddySession(target, host) {
       text: item.text,
       blocks: item.blocks,
       clientMessageId: item.clientMessageId,
+      ...(item.images !== undefined ? { images: item.images } : {}),
     })
     turnActive = true
     deliver(events) // user.message + turn.start
@@ -434,7 +474,8 @@ export async function createCodebuddySession(target, host) {
 
   /** AgentInput → the stream-json user content. Text stays a plain string;
    *  declared blocks map onto ContentBlock shapes, unknown kinds are skipped
-   *  with debug (images land with the images capability work). */
+   *  with debug; validated image attachments (T6) land as the SDK's base64
+   *  image blocks after the text. */
   function buildContent(item) {
     const mapped = []
     if (typeof item.text === 'string' && item.text !== '') mapped.push({ type: 'text', text: item.text })
@@ -445,8 +486,12 @@ export async function createCodebuddySession(target, host) {
         debug(`unsupported input block kind ${JSON.stringify(block?.kind)} skipped`)
       }
     }
+    // Image blocks were validated + encoded at submit time (codebuddyImageBlocks).
+    for (const block of Array.isArray(item.imageBlocks) ? item.imageBlocks : []) {
+      mapped.push(block)
+    }
     if (mapped.length === 0) return ''
-    if (mapped.length === 1) return mapped[0].text
+    if (mapped.length === 1 && mapped[0].type === 'text') return mapped[0].text
     return mapped
   }
 
@@ -543,14 +588,35 @@ export async function createCodebuddySession(target, host) {
     if (dead) return { accepted: false, reason: codebuddyText('session-dead', locale) }
     const text = typeof input?.text === 'string' ? input.text : ''
     const hasBlocks = Array.isArray(input?.blocks) && input.blocks.length > 0
-    if (text === '' && !hasBlocks) {
+    const images = Array.isArray(input?.images) ? input.images : []
+    if (text === '' && !hasBlocks && images.length === 0) {
       return { accepted: false, reason: codebuddyText('submit-empty', locale) }
+    }
+    // Images (T6): read back and checked against the limits ONCE MORE at
+    // submit (claude's convention — a limit change, a foreign facade); a
+    // violation refuses the WHOLE message with the localized reason, never a
+    // message silently missing an image. Encoded at submit time: queued
+    // placements (steer/followup/now) carry their payload with them, and the
+    // stdin write at beginTurn stays synchronous.
+    let imageBlocks = []
+    if (images.length > 0) {
+      try {
+        imageBlocks = await codebuddyImageBlocks(images, CODEBUDDY_IMAGE_LIMITS, localeText)
+      } catch (error) {
+        return { accepted: false, reason: String(error?.message ?? error) }
+      }
     }
     const clientMessageId = typeof input?.clientMessageId === 'string' && input.clientMessageId !== ''
       ? input.clientMessageId
       : `cb-${randomUUID()}`
     const kind = placement === 'steer' || placement === 'followup' || placement === 'now' ? placement : 'turn'
-    const item = { clientMessageId, text, blocks: input?.blocks, placement: kind }
+    const item = {
+      clientMessageId,
+      text,
+      blocks: input?.blocks,
+      ...(images.length > 0 ? { images, imageBlocks } : {}),
+      placement: kind,
+    }
     // Gate on turnActive (not `status === 'running'`): during
     // 'requires-action' the current turn is stalled on an approval but still
     // open — steer/followup must queue and `now` must interrupt it, same as
@@ -720,6 +786,68 @@ export async function createCodebuddySession(target, host) {
     return settlePromise
   }
 
+  // ── the models capability (ticket T6) ────────────────────────────────────
+  // SDK basis (codebuddy-sdk notes §4): `q.supportedModels()` re-issues the
+  // initialize control request and answers `{value, displayName, description}`
+  // — the public, sanctioned list path. The RUNTIME switch: SDK 0.3.307's
+  // `q.setModel()` is useless in this wiring — it only sends set_model when
+  // `q._sessionId` is set, and that field is captured inside the query()'s own
+  // read iterator, which this session deliberately bypasses (ONE long-lived
+  // transport read loop; see the module header). So the switch goes out as the
+  // same direct control request the interrupt path uses
+  // (`q.transport.sendControlRequest`), awaiting the CLI's ack as delivery
+  // evidence. The CLI's acceptance is not observable (fire-and-forget in the
+  // SDK; no receipt subtype), so `switched` means delivered+acked, honestly.
+  /** list(): dead/disposed sessions must NEVER touch the transport — the SDK
+   *  re-spawns the CLI on control requests to a dead process (auto-start
+   *  footgun, same guard as sendInterrupt) — so they fail loudly instead. */
+  async function listModels() {
+    if (disposed || dead) {
+      throw new Error(codebuddyText('models-list-unavailable', localeOf(host)))
+    }
+    const infos = await q.supportedModels()
+    return (Array.isArray(infos) ? infos : [])
+      .filter(info => info !== null && typeof info === 'object' && typeof info.value === 'string' && info.value !== '')
+      .map(info => ({
+        provider: 'codebuddy',
+        id: info.value,
+        label: typeof info.displayName === 'string' && info.displayName !== '' ? info.displayName : info.value,
+        ...(typeof info.description === 'string' && info.description !== '' ? { description: info.description } : {}),
+      }))
+  }
+
+  /** set(ref): validate → deliver the set_model control request (acked) →
+   *  persist to the backend's own settings store (applies to the NEXT session
+   *  open) → mirror the host's model.changed vocabulary. Refusals carry the
+   *  localized reason. */
+  async function setModel(ref) {
+    const locale = localeOf(host)
+    const model = ref !== null && typeof ref === 'object' && typeof ref.model === 'string' ? ref.model : undefined
+    if (model === undefined || model === '') {
+      return { kind: 'refused', reason: codebuddyText('model-invalid-ref', locale) }
+    }
+    if (disposed || dead) {
+      return { kind: 'refused', reason: codebuddyText('session-dead', locale) }
+    }
+    try {
+      await q.transport.sendControlRequest({
+        subtype: 'set_model',
+        ...(cliSessionId ? { session_id: cliSessionId } : {}),
+        model,
+      }, MODEL_ACK_TIMEOUT_MS)
+    } catch (error) {
+      return { kind: 'refused', reason: codebuddyText('model-refused', locale, { detail: String(error?.message ?? error) }) }
+    }
+    currentModel = model
+    try {
+      settings.setModel(model)
+    } catch (error) {
+      debug(`model choice persistence failed: ${error?.message}`)
+    }
+    deliver([{ type: 'model.changed', model, provider: 'codebuddy', source: 'user' }])
+    return { kind: 'switched' }
+  }
+
   return {
     ref: { backendId: BACKEND_ID, sessionId: sessionKey },
     get cwd() {
@@ -728,12 +856,23 @@ export async function createCodebuddySession(target, host) {
     get status() {
       return status
     },
-    // 每个成员缺席＝明确"不支持"（notes §3）；permissions 是 T3 的审批能力：
-    // respond 把面板决策送回 CLI，pending 列出仍挂起的请求（重开面板用）。
+    // 每个成员缺席＝明确"不支持"（notes §3）；capabilities 与 manifest 声明
+    // （permissions / models / images）完全一致，一致性由
+    // test/capabilities.test.js 钉住。permissions 是 T3 的审批能力：respond
+    // 把面板决策送回 CLI，pending 列出仍挂起的请求（重开面板用）。models
+    // （T6）与 images limits（T6）见上方各自的说明。
     capabilities: {
       permissions: {
         respond: bridge.respond,
         pending: () => bridge.pendingViews(),
+      },
+      models: {
+        list: listModels,
+        current: () => ({ provider: 'codebuddy', model: currentModel ?? '' }),
+        set: setModel,
+      },
+      images: {
+        limits: CODEBUDDY_IMAGE_LIMITS,
       },
     },
     history,

@@ -802,3 +802,169 @@ test('approval option labels speak the host locale: zh and en', async () => {
     }
   }
 })
+
+// ── T6 slice: the images capability ──────────────────────────────────────────
+
+/** A valid 1×1 PNG, base64 — the bytes the stub will actually receive. */
+const PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+
+/** A minimal ImageRef facade (host TranscriptImage shape): lazy bytes behind
+ *  read(), declared media type, optional stored-size hint. */
+function imageRef({ id = 'img1', name = 'dot.png', mediaType = 'image/png', byteLength, readResult } = {}) {
+  const data = byteLength !== undefined
+    ? new Uint8Array(byteLength).fill(1)
+    : new Uint8Array(Buffer.from(PNG_BASE64, 'base64'))
+  return {
+    id,
+    width: 1,
+    height: 1,
+    name,
+    mediaType,
+    bytes: data.byteLength,
+    read: readResult !== undefined ? readResult : () => Promise.resolve(data),
+  }
+}
+
+function readUserMessages(markerDir) {
+  const lines = []
+  try {
+    const raw = readFileSync(join(markerDir, 'stub-user-messages.jsonl'), 'utf8')
+    for (const line of raw.split('\n')) {
+      if (line.trim() !== '') lines.push(JSON.parse(line))
+    }
+  } catch {
+    // no evidence yet
+  }
+  return lines
+}
+
+test('images capability declares frozen limits matching the SDK ImageMediaType union', async () => {
+  const open = await openSession()
+  try {
+    const limits = open.session.capabilities.images.limits
+    assert.deepEqual(limits, {
+      mediaTypes: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'],
+      maxImageBytes: 5 * 1024 * 1024,
+      maxImagesPerMessage: 20,
+      maxMessageImageBytes: 20 * 1024 * 1024,
+      maxImageDimension: 2000,
+      maxImagePixels: 4_000_000,
+    })
+    assert.ok(Object.isFrozen(limits) && Object.isFrozen(limits.mediaTypes), 'limits are frozen')
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('submit with images maps to base64 image blocks on the CLI payload and echoes the refs', async () => {
+  const open = await openSession()
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+
+    const image = imageRef({ id: 'img-1', name: 'dot.png', mediaType: 'image/png' })
+    const accepted = await session.submit({
+      text: '看这张图',
+      images: [image],
+      clientMessageId: 'u-img',
+    }, 'turn')
+    assert.deepEqual(accepted, { accepted: true })
+    await waitFor(batches, batches2 => turnEnded(batches2) >= 1, { what: 'turn.end' })
+
+    // The user row echoes the refs the channel handed in (attachment chips).
+    const userMessage = flatten(batches).find(e => e.type === 'user.message')
+    assert.equal(userMessage.id, 'u-img')
+    assert.deepEqual(userMessage.images, [image])
+
+    // The payload that reached the CLI: text block first, then the image
+    // block in the SDK's base64-source shape — pure base64, no data: prefix.
+    const payloads = readUserMessages(open.markerDir).map(record => record.content)
+    const withImage = payloads.find(Array.isArray)
+    assert.ok(withImage, 'an image submit reaches the CLI as block content')
+    assert.deepEqual(withImage, [
+      { type: 'text', text: '看这张图' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG_BASE64 } },
+    ])
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('a text-only submit still reaches the CLI as a plain string content', async () => {
+  const open = await openSession()
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'hi', clientMessageId: 'u1' }, 'turn')
+    await waitFor(batches, batches2 => turnEnded(batches2) >= 1, { what: 'turn.end' })
+    const payloads = readUserMessages(open.markerDir).map(record => record.content)
+    assert.ok(payloads.includes('hi'), 'single-text content stays a bare string')
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('images over the limits are refused with bilingual reasons and never reach the CLI', async () => {
+  for (const locale of ['zh', 'en']) {
+    const open = await openSession({ host: host({ locale }) })
+    try {
+      const session = open.session
+      const batches = collect(session)
+      await waitFor(batches, readySeen, { what: 'session.ready' })
+
+      // Unsupported media type (outside limits.mediaTypes).
+      const badType = await session.submit({ text: 'x', images: [imageRef({ mediaType: 'image/svg+xml' })], clientMessageId: 'u1' }, 'turn')
+      assert.equal(badType.accepted, false)
+      assert.ok(
+        locale === 'en' ? /unsupported/i.test(badType.reason) : badType.reason.includes('不受支持'),
+        `${locale} type reason: ${badType.reason}`,
+      )
+
+      // One image over the per-image byte cap (measured from the real bytes).
+      const tooBig = await session.submit({ text: 'x', images: [imageRef({ byteLength: 5 * 1024 * 1024 + 1 })], clientMessageId: 'u2' }, 'turn')
+      assert.equal(tooBig.accepted, false)
+      assert.ok(
+        locale === 'en' ? /exceeds/i.test(tooBig.reason) : tooBig.reason.includes('超过'),
+        `${locale} size reason: ${tooBig.reason}`,
+      )
+
+      // More images than the per-message cap.
+      const tooMany = await session.submit({
+        text: 'x',
+        images: Array.from({ length: 21 }, (_, i) => imageRef({ id: `img-${i}` })),
+        clientMessageId: 'u3',
+      }, 'turn')
+      assert.equal(tooMany.accepted, false)
+      assert.ok(
+        locale === 'en' ? tooMany.reason.includes('20') : tooMany.reason.includes('20'),
+        `${locale} count reason: ${tooMany.reason}`,
+      )
+
+      // Aggregate byte cap across the message: six 4 MiB images pass the
+      // per-image cap but sum past 20 MiB.
+      const aggregate = await session.submit({
+        text: 'x',
+        images: Array.from({ length: 6 }, (_, i) => imageRef({ id: `img-a${i}`, byteLength: 4 * 1024 * 1024 })),
+        clientMessageId: 'u4',
+      }, 'turn')
+      assert.equal(aggregate.accepted, false)
+
+      // An unreadable facade refuses honestly instead of sending a truncated message.
+      const unreadable = await session.submit({
+        text: 'x',
+        images: [imageRef({ readResult: () => Promise.reject(new Error('gone')) })],
+        clientMessageId: 'u5',
+      }, 'turn')
+      assert.equal(unreadable.accepted, false)
+      assert.ok(typeof unreadable.reason === 'string' && unreadable.reason.length > 0)
+
+      // Nothing reached the CLI: no user payload lines at all.
+      assert.deepEqual(readUserMessages(open.markerDir), [])
+      assert.ok(!flatten(batches).some(e => e.type === 'turn.start'), 'refused inputs open no turn')
+    } finally {
+      await closeSession(open)
+    }
+  }
+})
