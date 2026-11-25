@@ -106,6 +106,16 @@ async function waitFor(batches, predicate, { timeoutMs = 5000, what = 'condition
   assert.fail(`timed out waiting for ${what}; events so far: ${JSON.stringify(flatten(batches).map(e => e.type))}`)
 }
 
+/** Stub-side evidence lives in marker files; wait for one to appear. */
+async function waitForMarker(markerDir, prefix, { timeoutMs = 5000, what = 'marker' } = {}) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (readdirSync(markerDir).some(name => name.startsWith(prefix))) return
+    await new Promise(resolve => setTimeout(resolve, 15))
+  }
+  assert.fail(`timed out waiting for ${what} (${prefix}*) in ${markerDir}`)
+}
+
 // Predicates receive the flattened EVENT list (waitFor flattens the batches).
 const readySeen = events => events.some(e => e.type === 'session.ready')
 const turnEnded = events => events.filter(e => e.type === 'turn.end').length
@@ -370,6 +380,11 @@ test('cancel(interrupt) interrupts the running turn, drops queued inputs, and re
     // No interrupt receipt exists in SDK 0.3.307 — the outcome must be honest.
     assert.deepEqual(receipt, { stillQueued: [], outcome: 'unknown' })
 
+    // The interrupt signal really reached the CLI process — stub-side marker
+    // evidence (acceptance: the interrupt arrives at the CLI, not just in our
+    // own state).
+    await waitForMarker(open.markerDir, 'stub-interrupt-', { what: 'interrupt marker' })
+
     // The queued input is dropped with dropped:true (channel keeps it as a
     // held row for the user to resend).
     await waitFor(batches, evs => evs.some(e => e.type === 'pending.changed' && e.dropped === true), { what: 'dropped pending' })
@@ -406,6 +421,55 @@ test('cancel(user) keeps queued inputs: they run after the interrupted turn ends
     assert.deepEqual(reasons, ['interrupted', 'completed'])
     const users = flatten(batches).filter(e => e.type === 'user.message').map(e => e.id)
     assert.deepEqual(users, ['uA', 'uB'], 'the kept input runs next')
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('cancel at idle reports a confirmed receipt — a true snapshot of the live queue', async () => {
+  const open = await openSession()
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'short', clientMessageId: 'u1' }, 'turn')
+    await waitFor(batches, batches2 => turnEnded(batches2) >= 1, { what: 'turn end' })
+
+    // Nothing is in flight, so the local queue IS the live queue: confirmed
+    // is a real snapshot the channel may read as "the queue is now empty".
+    const receipt = await session.cancel('interrupt')
+    assert.deepEqual(receipt, { stillQueued: [], outcome: 'confirmed' })
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('cancel on a disposed session reports failed', async () => {
+  const open = await openSession()
+  try {
+    await open.session.dispose()
+    const receipt = await open.session.cancel('user')
+    assert.deepEqual(receipt, { stillQueued: [], outcome: 'failed' })
+  } finally {
+    await closeSession(open)
+  }
+})
+
+test('cancel on a dead CLI reports failed and the death was announced', async () => {
+  const open = await openSession({ scenario: { exitAfterFirstUser: true } })
+  try {
+    const session = open.session
+    const batches = collect(session)
+    await waitFor(batches, readySeen, { what: 'session.ready' })
+    await session.submit({ text: 'running', clientMessageId: 'uA' }, 'turn')
+    // The stub dies mid-turn without a result; the pump announces the loss.
+    await waitFor(batches, evs => evs.some(e => e.type === 'notice' && e.level === 'error'), { what: 'cli-exited notice' })
+    await waitForMarker(open.markerDir, 'stub-exit-', { what: 'stub exit marker' })
+
+    // There is no CLI left to cancel — the receipt must say failed, never
+    // confirmed (a failed cancel must not read as "the queue is empty").
+    const receipt = await session.cancel('interrupt')
+    assert.deepEqual(receipt, { stillQueued: [], outcome: 'failed' })
   } finally {
     await closeSession(open)
   }

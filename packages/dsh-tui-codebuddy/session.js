@@ -35,6 +35,12 @@ import { codebuddyText } from './text.js'
 
 const BACKEND_ID = 'codebuddy'
 
+// Ack window for the interrupt control request. The SDK's own default is 60s
+// (the initialize handshake scale); an interrupt ack that takes longer than
+// 10s means the CLI is effectively gone — the session-level force-settle
+// backstop (below) owns the turn from there.
+const INTERRUPT_ACK_TIMEOUT_MS = 10_000
+
 function localeOf(host) {
   try {
     return host?.locale?.() === 'en' ? 'en' : 'zh'
@@ -257,19 +263,31 @@ export async function createCodebuddySession(target, host) {
     .catch(error => debug(`streamInput ended: ${error?.message}`))
 
   function sendInterrupt() {
+    // Guard the SDK's auto-restart footgun (verified against 0.3.307
+    // process-transport.js): sendControlRequest begins with `this.start()`,
+    // which re-spawns the CLI whenever `process` is null — INCLUDING when the
+    // previous CLI already died. A cancel on a lost session must never
+    // conjure a fresh CLI process out of thin air, so a dead/disposed
+    // transport is reported 'failed' without touching it.
+    if (disposed || dead) return 'failed'
     // SDK 0.3.307 has no interrupt receipt — the CLI ends the interrupted turn
     // with a success result carrying terminal_reason:'interrupt' (notes §2.2),
     // which the translator maps to turn.end{interrupted}.
     try {
+      // Short ack window: a dying CLI cannot ack, and the SDK's default 60s
+      // request timer would then outlive the turn it was meant to end. (The
+      // ack is delivery evidence, NOT a queue receipt — see cancel().)
       q.transport
         .sendControlRequest({
           subtype: 'interrupt',
           ...(cliSessionId ? { session_id: cliSessionId } : {}),
           reason: 'user interrupt',
-        })
+        }, INTERRUPT_ACK_TIMEOUT_MS)
         .then(undefined, error => debug(`interrupt control request failed: ${error?.message}`))
+      return 'sent'
     } catch (error) {
       debug(`interrupt failed: ${error?.message}`)
+      return 'failed'
     }
   }
 
@@ -344,7 +362,17 @@ export async function createCodebuddySession(target, host) {
   }
 
   async function cancel(cause = 'user') {
-    if (disposed) return { stillQueued: [], outcome: 'failed' }
+    // Receipt semantics (notes §2, ticket T4): outcome 'confirmed' is the ONLY
+    // value a channel may read as "the live queue is now empty" — it is a
+    // backend-queue snapshot. 'unknown' and 'failed' leave stillQueued as a
+    // REQUEST-TIME snapshot that must never be read as "queue empty".
+    const stillQueued = () => queue.map(item => item.clientMessageId)
+    if (disposed) return { stillQueued: stillQueued(), outcome: 'failed' }
+    if (dead) {
+      // There is no CLI left to cancel; a failed cancel must not read as
+      // confirmed (that would claim a queue state nobody maintains anymore).
+      return { stillQueued: stillQueued(), outcome: 'failed' }
+    }
     const leaving = cause === 'interrupt' || cause === 'switch' || cause === 'dispose'
     const hadPending = queue.some(item => PENDING_PLACEMENTS.has(item.placement))
     if (leaving) {
@@ -353,13 +381,15 @@ export async function createCodebuddySession(target, host) {
       for (const item of queue.splice(0)) debug(`dropped queued input ${item.clientMessageId} (cancel ${cause})`)
     }
     const running = status === 'running'
-    if (running) sendInterrupt()
+    const sent = running ? sendInterrupt() : undefined
     syncPending(leaving && hadPending ? { dropped: true } : {})
     return {
-      stillQueued: queue.map(item => item.clientMessageId),
-      // confirmed 只有在队列状态确定时才诚实：空闲＝队列确定空；回 合在跑时
-      // 没有回执机制 → unknown（绝不能被读成"队列空了"）。
-      outcome: running ? 'unknown' : 'confirmed',
+      stillQueued: stillQueued(),
+      // running: SDK 0.3.307 回执只有 control ack（送达证据），没有任何机制
+      // 回答"回合/队列真的停了吗"——诚实值是 unknown；连 ack 请求都发不出去
+      // 则是 failed（cancel 本身失败）。idle：没有在途操作，本地队列就是
+      // 活队列，confirmed 是真实快照。
+      outcome: running ? (sent === 'sent' ? 'unknown' : 'failed') : 'confirmed',
     }
   }
 
