@@ -19,18 +19,31 @@
  *   { "sessionId"?: string, "model"?: string,
  *     "afterInit"?: Frame[],                       // emitted once after init
  *     "turns"?: [{ "frames"?: Frame[],             // emitted on the Nth user message
- *                 "resultDelayMs"?: number }] }    // delay before the default result
- * Frames are written verbatim; `uuid` / `session_id` are default-filled.
+ *                 "resultDelayMs"?: number }],     // delay before the default result
+ *     "resume"?: {                                 // only consulted with --resume in argv
+ *       "sessionId"?: string,                      // session id declared at the handshake
+ *       "unknownSession"?: true,                   // exit non-zero immediately: not found
+ *       "historyDelayMs"?: number,                 // pacing between history turns
+ *       "history"?: [{ "user": string,             // historical user message (text)
+ *                     "assistant"?: Block[],       // assistant message after the user row
+ *                     "toolResult"?: { "toolUseId", "content"?, "isError"? },
+ *                     "assistant2"?: Block[] }] }  // assistant message after the tool result
+ *   }
+ * Every history turn is closed with a result frame (the CLI replays each
+ * historical turn to its terminal state — credits-doc evidence: replayed
+ * results exist and carry no turnUsage). Frames are written verbatim;
+ * `uuid` / `session_id` are default-filled.
  */
 import readline from 'node:readline'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const markerDir = process.env.CB_FAKE_MARKER_DIR
-function mark(kind) {
+function mark(kind, code) {
   if (!markerDir) return
   try {
-    writeFileSync(join(markerDir, `stub-${kind}-${process.pid}`), String(process.pid))
+    // Exit markers carry the exit code as content — the loud-failure evidence.
+    writeFileSync(join(markerDir, `stub-${kind}-${process.pid}`), code !== undefined ? String(code) : String(process.pid))
   } catch {
     // evidence is best-effort; never break the stub over it
   }
@@ -49,7 +62,21 @@ const requestedSessionId = (() => {
   return flagIndex !== -1 ? process.argv[flagIndex + 1] : undefined
 })()
 
-const sessionId = requestedSessionId ?? scenario.sessionId ?? 'stub-session-0001'
+// ── resume script (ticket T5): the SDK passes `--resume <id>` on the argv ────
+const resumeFlagIndex = process.argv.indexOf('--resume')
+const resumeTargetId = resumeFlagIndex !== -1 ? process.argv[resumeFlagIndex + 1] : undefined
+const resumeSpec = resumeTargetId !== undefined ? (scenario.resume ?? {}) : null
+
+if (resumeSpec?.unknownSession === true) {
+  // 指定会话不存在：CLI 响亮退出（非零），绝不静默回落新会话。
+  mark('exit', 1)
+  process.stderr.write(`codebuddy stub: session ${resumeTargetId} not found\n`)
+  process.exit(1)
+}
+
+const sessionId = resumeSpec !== null
+  ? (resumeSpec.sessionId ?? resumeTargetId) // the handshake declares the resumed id
+  : (requestedSessionId ?? scenario.sessionId ?? 'stub-session-0001')
 const model = scenario.model ?? 'stub-model'
 
 let uuidCounter = 0
@@ -84,6 +111,38 @@ out({
 mark('start')
 
 for (const frame of scenario.afterInit ?? []) out(frame)
+
+// ── resume history replay: handshake declares the id → history lines → live ──
+function emitHistoryTurn(turnSpec, index) {
+  out({ type: 'user', parent_tool_use_id: null, message: { role: 'user', content: turnSpec.user ?? '' } })
+  if (Array.isArray(turnSpec.assistant) && turnSpec.assistant.length > 0) {
+    out({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: `msg_h${index}a`, type: 'message', role: 'assistant', model,
+        content: turnSpec.assistant, stop_reason: 'end_turn', stop_sequence: null,
+        usage: { input_tokens: 10, output_tokens: 5 } },
+    })
+  }
+  if (turnSpec.toolResult) {
+    const tr = turnSpec.toolResult
+    out({
+      type: 'user', parent_tool_use_id: null,
+      message: { role: 'user', content: [{
+        type: 'tool_result', tool_use_id: tr.toolUseId, content: tr.content ?? '',
+        ...(tr.isError === true ? { is_error: true } : {}),
+      }] },
+    })
+  }
+  if (Array.isArray(turnSpec.assistant2) && turnSpec.assistant2.length > 0) {
+    out({
+      type: 'assistant', parent_tool_use_id: null,
+      message: { id: `msg_h${index}b`, type: 'message', role: 'assistant', model,
+        content: turnSpec.assistant2, stop_reason: 'end_turn', stop_sequence: null,
+        usage: { input_tokens: 10, output_tokens: 5 } },
+    })
+  }
+  defaultResult({ resultText: turnSpec.user ?? '' })
+}
 
 // ── turn scripts ──────────────────────────────────────────────────────────────
 let cumulativeInput = 0
@@ -157,6 +216,22 @@ function startTurn(userText) {
   emitScriptTurn(script)
 }
 
+// The replay runs at boot, after the turn-script machinery is initialized
+// (defaultResult owns the cumulative usage counters).
+if (resumeSpec !== null && Array.isArray(resumeSpec.history) && resumeSpec.history.length > 0) {
+  const delayMs = typeof resumeSpec.historyDelayMs === 'number' ? resumeSpec.historyDelayMs : 0
+  let index = 0
+  const emitNext = () => {
+    emitHistoryTurn(resumeSpec.history[index], index)
+    index += 1
+    if (index < resumeSpec.history.length) {
+      if (delayMs > 0) setTimeout(emitNext, delayMs)
+      else emitNext()
+    }
+  }
+  emitNext()
+}
+
 // ── control requests: always answer, or the SDK's 60s timeout fires ──────────
 function handleControlRequest(line) {
   const { request_id: requestId, request } = line
@@ -203,6 +278,6 @@ rl.on('line', raw => {
   }
 })
 rl.on('close', () => {
-  mark('exit')
+  mark('exit', 0)
   process.exit(0) // EOF → immediate exit: the SDK's 8s Windows backstop never fires
 })

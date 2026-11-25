@@ -31,6 +31,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { createCodebuddyTranslator } from './translator.js'
+import { createCodebuddyPrefs } from './prefs.js'
 import { codebuddyText } from './text.js'
 
 const BACKEND_ID = 'codebuddy'
@@ -100,49 +101,105 @@ function createInbox() {
 }
 
 export async function createCodebuddySession(target, host) {
-  if (target?.kind !== 'create') {
-    // 响亮拒绝：resume 的转录回放 + `--resume` 启动在 T5 落地；绝不静默回退新会话。
-    throw new Error(codebuddyText('resume-not-implemented', localeOf(host)))
+  const locale = localeOf(host)
+  const isResume = target?.kind === 'resume'
+  if (!isResume && target?.kind !== 'create') {
+    throw new Error('dsh-tui-codebuddy: open target must be kind "create" or "resume"')
   }
-  const cwd = typeof target.cwd === 'string' && target.cwd !== '' ? target.cwd : host?.cwd
+  const resumeId = isResume
+    ? (typeof target.sessionId === 'string' && target.sessionId.trim() !== '' ? target.sessionId : null)
+    : null
+  if (isResume && resumeId === null) {
+    // 响亮拒绝：没有有效会话 id 的 resume 不存在"猜一个"的路径。
+    throw new Error(codebuddyText('resume-invalid-target', locale))
+  }
+  const cwd = typeof target?.cwd === 'string' && target.cwd !== '' ? target.cwd : host?.cwd
   if (typeof cwd !== 'string' || cwd === '') {
     throw new Error('dsh-tui-codebuddy: open target needs a cwd')
   }
   const debug = debugOf(host)
+  // lastSession memory (notes §2): the launcher's bare `--resume` reads this
+  // store; the session records the CLI-confirmed session id the moment the
+  // init frame confirms it. No dataDir → in-memory per host (never guessed).
+  const prefs = createCodebuddyPrefs(host)
 
   // Lazy SDK import: the bundle module itself must stay side-effect-free and
   // light (the Loader imports it before detect/open); the SDK is only loaded
   // when a session really opens.
   const { query } = await import('@tencent-ai/agent-sdk')
 
-  const sessionKey = randomUUID()
-  const translator = createCodebuddyTranslator({ cwd, now: Date.now, debug })
+  // Resume keeps the requested id as the session ref identity; create mints
+  // one and the CLI echoes it back in the init frame.
+  const sessionKey = isResume ? resumeId : randomUUID()
+  // One translator for replay AND live (docs/decisions.md MVP item 2): the
+  // replay phase seeds the same seq/turn counters the live stream continues.
+  const translator = createCodebuddyTranslator({ cwd, now: Date.now, debug, replay: isResume })
 
   // Options per the notes (§1): cwd; default permission mode (modes control is
   // T4); includePartialMessages to receive stream_event deltas; settingSources
   // untouched so the SDK sends `--setting-sources none` (full isolation from
-  // filesystem settings); our session id up front so ref.sessionId is known at
-  // open time and the init frame echoes it back. No canUseTool yet — approvals
-  // are T3; a can_use_tool request without a handler is auto-denied by the SDK.
-  const q = query({
-    options: {
-      cwd,
-      sessionId: sessionKey,
-      permissionMode: 'default',
-      includePartialMessages: true,
-      stderr: data => {
-        try {
-          (host?.stderr ?? host?.debug)?.(data)
-        } catch {
-          // diagnostics must never break the session
-        }
+  // filesystem settings). Resume passes `--resume <id>` (SDK §1) with NO
+  // prompt: initialize carries hasPrompt:false, so the CLI replays the
+  // persisted history into the stream without triggering a model response.
+  // No canUseTool yet — approvals are T3; a can_use_tool request without a
+  // handler is auto-denied by the SDK.
+  //
+  // The handshake stderr is captured (last 2 KB): when the CLI dies during
+  // the handshake the SDK's rejection reason can be as vague as "stdout
+  // closed unexpectedly" (a close/exit race), and the resume failure must
+  // carry the REAL cause — the CLI's own last words on stderr.
+  let handshakeStderrActive = true
+  let handshakeStderr = ''
+  const stderrSink = data => {
+    if (handshakeStderrActive) handshakeStderr = (handshakeStderr + String(data)).slice(-2000)
+    try {
+      (host?.stderr ?? host?.debug)?.(data)
+    } catch {
+      // diagnostics must never break the session
+    }
+  }
+  let q
+  try {
+    q = query({
+      options: {
+        cwd,
+        ...(isResume ? { resume: sessionKey } : { sessionId: sessionKey }),
+        permissionMode: 'default',
+        includePartialMessages: true,
+        stderr: stderrSink,
       },
-    },
-  })
-
-  // Spawn + initialize handshake; a missing/broken CLI fails LOUDLY here —
-  // open() rejects instead of returning a half-alive session.
-  await q.connect()
+    })
+    // Spawn + initialize handshake; a missing/broken CLI fails LOUDLY here —
+    // open() rejects instead of returning a half-alive session.
+    await q.connect()
+    handshakeStderrActive = false
+  } catch (error) {
+    handshakeStderrActive = false
+    if (!isResume) throw error
+    // 响亮失败（票面验收）：会话不存在 / CLI 不可用 / resume 被拒——不回落、
+    // 不静默新建。SDK 的关闭原因 + CLI 的 stderr 尾巴一起给出真实原因。
+    // The SDK acquires its process-level session lock inside initialize();
+    // when the handshake fails the lock would leak and poison every later
+    // resume of the same id in this process. Query.cleanup() is the SDK's own
+    // teardown (releases the lock, closes the transport) and is synchronous —
+    // q.return() is NOT usable here: it waits on the never-settling
+    // initialize await and hangs the failure path.
+    try {
+      q?.cleanup?.()
+    } catch {
+      // teardown of a half-started query is best-effort here
+    }
+    if (q?.cleanup === undefined) {
+      try {
+        q?.transport?.close?.()
+      } catch {
+        // the transport may already be gone with the CLI process
+      }
+    }
+    const reason = String(error?.message ?? error)
+    const detail = handshakeStderr !== '' ? `${reason} | stderr: ${handshakeStderr.trim()}` : reason
+    throw new Error(codebuddyText('resume-failed', locale, { detail }))
+  }
 
   // ── session state ────────────────────────────────────────────────────────
   let disposed = false
@@ -154,11 +211,47 @@ export async function createCodebuddySession(target, host) {
   const queue = [] // {clientMessageId, text, blocks, placement}
   const inbox = createInbox()
 
+  // ── resume replay phase (ticket T5) ───────────────────────────────────────
+  // Transcript events produced while the translator is in replay mode are the
+  // history seed: they go to replaySeed and reach the channel exactly once,
+  // through history() — never through subscribe (先画历史再接 live). Only
+  // session-family events (ready/status/notices) stay on the live stream.
+  let replaySeed = []
+  let seedHanded = false
+  let settlePromise = null
+  let frameCount = 0
+  const REPLAY_QUIESCE_MS = 120 // stdout silence window that ends the replay
+  const REPLAY_SETTLE_MAX_MS = 5000 // hard cap: never wait forever on a CLI
+  const REPLAY_LIVE_TYPES = new Set(['session.ready', 'session.status', 'notice', 'pending.changed', 'session.title'])
+
+  /** Deliver events: routed to the replay seed while the replay phase is
+   *  active, otherwise dispatched to subscribers/backlog. */
   function deliver(events) {
     if (!Array.isArray(events) || events.length === 0) return
     for (const event of events) {
-      if (event.type === 'session.ready' && event.sessionId) cliSessionId = event.sessionId
+      if (event.type === 'session.ready' && event.sessionId) {
+        cliSessionId = event.sessionId
+        try {
+          prefs.setLastSession(cliSessionId)
+        } catch (error) {
+          debug(`lastSession recording failed: ${error?.message}`)
+        }
+      }
     }
+    if (translator.replayActive()) {
+      const seedPart = []
+      const livePart = []
+      for (const event of events) {
+        (REPLAY_LIVE_TYPES.has(event.type) ? livePart : seedPart).push(event)
+      }
+      if (seedPart.length > 0) replaySeed.push(...seedPart)
+      if (livePart.length > 0) dispatch(livePart)
+      return
+    }
+    dispatch(events)
+  }
+
+  function dispatch(events) {
     const onlyDeltas = events.every(event => event.type === 'assistant.delta')
     const meta = { replay: false, wake: onlyDeltas ? 'frame' : 'sync' }
     if (listeners.size === 0) {
@@ -214,9 +307,14 @@ export async function createCodebuddySession(target, host) {
     inbox.push(userMessageFrame(item))
   }
 
-  /** A turn just ended: back to idle, then run the next queued input. */
+  /** A turn just ended: back to idle, then run the next queued input. During
+   *  the resume replay phase a turn.end is a HISTORICAL turn closing — queued
+   *  live inputs must wait for the phase to end (the history() settle), or
+   *  their stdin write would interleave with the CLI's replay output and the
+   *  translator could not tell replay frames from live ones. */
   function drainQueue() {
     if (disposed) return
+    if (translator.replayActive()) return
     setStatus('idle')
     const next = queue.shift()
     if (next === undefined) return
@@ -281,6 +379,7 @@ export async function createCodebuddySession(target, host) {
     try {
       for await (const message of q.transport.messages()) {
         if (disposed) break
+        frameCount += 1
         try {
           const events = translator.translate(message)
           deliver(events)
@@ -326,12 +425,14 @@ export async function createCodebuddySession(target, host) {
       : `cb-${randomUUID()}`
     const kind = placement === 'steer' || placement === 'followup' || placement === 'now' ? placement : 'turn'
     const item = { clientMessageId, text, blocks: input?.blocks, placement: kind }
-    if (status === 'running') {
+    if (status === 'running' || translator.replayActive()) {
+      // Running turn OR resume replay still in flight: queue (the replay
+      // phase's settle releases the queue — notes in drainQueue).
       if (kind === 'now') {
         // 笔记语义：now = 打断当前回合立即投递。SDK 0.3.307 的 streamInput 没有
         // 优先级通道（claude 的 priority 'now' 在这里没有对应物），就近实现为：
         // interrupt 当前回合 + 本输入插队，回合收口后第一个运行。T4 收口完整语义。
-        sendInterrupt()
+        if (status === 'running') sendInterrupt()
         queue.unshift(item)
       } else {
         queue.push(item)
@@ -409,10 +510,39 @@ export async function createCodebuddySession(target, host) {
     }
   }
 
+  /** Wait until the resume replay stream has settled: the stdout silence
+   *  window passed with no new frames AND no replayed turn still open. A
+   *  truncated transcript (dangling turn, no frames coming) settles at the
+   *  hard cap; dispose/death settles immediately with what arrived. */
+  async function awaitReplaySettled() {
+    const deadline = Date.now() + REPLAY_SETTLE_MAX_MS
+    while (Date.now() < deadline && !disposed && !dead) {
+      const before = frameCount
+      await new Promise(resolve => setTimeout(resolve, REPLAY_QUIESCE_MS))
+      if (frameCount === before && !translator.replayTurnOpen()) return
+    }
+  }
+
   async function history() {
-    // 回放种子约定（notes §2）：新建会话返回 []。resume（T5）会把经同一翻译器
-    // 修好编号的转录事件从这里一次性交出，之后不再随会话存活。
-    return []
+    // 回放种子约定（notes §2）：一次性交接。新建会话返回 []；resume 先等到
+    // 回放流 settle，把经同一翻译器修好编号的转录事件（含悬挂回合的强制
+    // 收口）整批交出，之后置空——长转录不随会话存活。并发首次调用共享同一次
+    // settle；交接之后再问一律 []。
+    if (!isResume) return []
+    if (seedHanded) return []
+    if (settlePromise === null) {
+      settlePromise = (async () => {
+        await awaitReplaySettled()
+        const settleEvents = translator.settleReplay()
+        if (settleEvents.length > 0) replaySeed.push(...settleEvents)
+        seedHanded = true
+        const seed = replaySeed
+        replaySeed = [] // 交出后释放：长转录不随会话存活
+        drainQueue() // 放行回放期间排队等待的 live 输入
+        return seed
+      })()
+    }
+    return settlePromise
   }
 
   return {

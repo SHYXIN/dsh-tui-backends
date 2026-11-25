@@ -113,8 +113,14 @@ class AssertionError extends Error {
  *   cwd: session working directory (fallback when init omits it)
  *   now: clock injection returning epoch ms
  *   debug: sink for ignored-frame diagnostics (opt-in host debug, never user-visible)
+ *   replay: true for a resumed session — until `settleReplay()`, canonical
+ *     protocol frames arriving OUTSIDE a turn are the CLI's persisted-history
+ *     replay (ticket T5): user frames re-open their historical turn and every
+ *     family re-anchors to the CLI's own uuid. Live submits are impossible in
+ *     this mode (the session defers them until the settle), so the seq/turn
+ *     counters flow straight from the replay into the live stream.
  */
-export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {} } = {}) {
+export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {}, replay = false } = {}) {
   const audit = createIdentityAudit()
 
   // ── identity-map state ──────────────────────────────────────────────────
@@ -128,6 +134,7 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
   const callLocation = new Map() // callId → {turn, step} recorded at tool.call
   let readyEmitted = false
   let cumulativeUsage = null // session-cumulative tokens from the last result
+  let replayMode = replay === true // resume replay phase; ends only at settleReplay()
 
   const nextSeq = () => ++seq
 
@@ -388,17 +395,28 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
 
   function translateUserEcho(frame, time) {
     // stdin writes are not echoed back unless --replay-user-messages is on; a
-    // user frame on stdout carries tool_result blocks for the running turn.
+    // user frame on stdout carries tool_result blocks for the running turn —
+    // or, during the resume replay phase, the historical user message itself.
     if (frame.isReplay) return []
     const content = frame.message?.content
-    if (!Array.isArray(content)) return []
-    if (activeTurn === null) {
-      debug('user echo outside a turn ignored')
-      return []
+    const toolResultBlocks = Array.isArray(content)
+      ? content.filter(block => block?.type === 'tool_result')
+      : []
+    if (toolResultBlocks.length > 0) {
+      if (activeTurn === null) {
+        debug('tool result outside a turn ignored')
+        return []
+      }
+      return toolResultEvents(frame, toolResultBlocks, time)
     }
+    if (replayMode) return translateReplayUser(frame, content, time)
+    return [] // live mode: text user frames have no channel-side meaning
+  }
+
+  /** Shared tool_result → tool.result mapping (live echo and replay alike). */
+  function toolResultEvents(frame, blocks, time) {
     const events = []
-    for (const block of content) {
-      if (block?.type !== 'tool_result') continue
+    for (const block of blocks) {
       const callId = str(block.tool_use_id) ?? ''
       const location = callLocation.get(callId) ?? { turn: activeTurn.number, step }
       const { content: raw, text } = toolResultContent(block.content)
@@ -418,6 +436,50 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
       })
     }
     return events
+  }
+
+  /** Resume replay (ticket T5): a historical user frame re-opens its own turn
+   *  and is RE-ANCHORED to the CLI's native uuid — the T2 leftover (live user
+   *  rows anchor on the channel's clientMessageId) ends here: every replayed
+   *  family anchors on the transcript's own identity, so the host's
+   *  resume/rewind anchors are native across the whole seed. */
+  function translateReplayUser(frame, content, time) {
+    let text = ''
+    const blocks = []
+    if (typeof content === 'string') {
+      text = content
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block?.type === 'text' && typeof block.text === 'string') {
+          blocks.push({ kind: 'text', text: block.text })
+          text = text === '' ? block.text : `${text}\n${block.text}`
+        }
+      }
+    }
+    if (text === '' && blocks.length === 0) {
+      debug('replay user frame without text ignored')
+      return []
+    }
+    turn += 1
+    step = 0
+    activeTurn = { number: turn }
+    const anchor = str(frame.uuid) ?? `replay-user-${turn}`
+    // No seal() here — translate() seals every batch exactly once; a second
+    // seal would re-audit the same seqs against their own fresh state.
+    return [
+      {
+        type: 'user.message',
+        seq: nextSeq(),
+        anchor,
+        id: anchor,
+        turn: activeTurn.number,
+        time,
+        source: 'user',
+        text,
+        blocks,
+      },
+      { type: 'turn.start', turn: activeTurn.number, origin: 'user', userMessageId: anchor, time },
+    ]
   }
 
   function translateResult(frame, time) {
@@ -487,6 +549,24 @@ export function createCodebuddyTranslator({ cwd, now = Date.now, debug = () => {
     userSubmitted,
     translate,
     abandonTurn,
+    /** Resume replay phase active (frames outside turns are history). */
+    replayActive: () => replayMode,
+    /** A replayed turn is still open (the settle must not cut a live one). */
+    replayTurnOpen: () => replayMode && activeTurn !== null,
+    /** End of the replay phase — the ONLY way it ends. Closes a dangling
+     *  replayed turn (a transcript truncated before its result) as
+     *  interrupted so live numbering continues cleanly, and flips to live
+     *  mode. Idempotent. */
+    settleReplay(time = now()) {
+      if (!replayMode) return seal([])
+      replayMode = false
+      if (activeTurn === null) return seal([])
+      const ended = activeTurn
+      activeTurn = null
+      const events = closeOpenAttempt('aborted', time)
+      events.push({ type: 'turn.end', turn: ended.number, reason: { kind: 'interrupted' }, time })
+      return seal(events)
+    },
   }
 }
 

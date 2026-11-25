@@ -17,6 +17,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { codebuddyText } from './text.js'
 import { createCodebuddySession } from './session.js'
+import { createCodebuddyPrefs } from './prefs.js'
 
 const run = promisify(execFile)
 
@@ -142,10 +143,24 @@ export async function detect(host) {
 }
 
 /** Open a real CodeBuddy session: one long-lived streaming `query()` per
- *  session (session.js). Resume targets are loudly refused until the
- *  --resume replay lands (T5); create targets carry the session cwd. */
+ *  session (session.js). Resume targets replay the persisted history through
+ *  the same translator (one-shot history() seed) and then join the live
+ *  stream with continuous numbering; unknown ids and CLI failures fail
+ *  loudly — never a silent fallback to a new session. */
 export async function open(target, host) {
   return createCodebuddySession(target, host)
+}
+
+/** Bare `--resume` memory + the user-facing resume command (notes §2).
+ *  `sessionPrefs` is called by the launcher before any session opens and
+ *  shares its store with the sessions opened on the same host. */
+export const launch = {
+  sessionPrefs(host) {
+    return createCodebuddyPrefs(host)
+  },
+  resumeCommand(sessionId) {
+    return `codebuddy --resume ${sessionId}`
+  },
 }
 
 export const backend = {
@@ -153,6 +168,7 @@ export const backend = {
   descriptor: { label: 'CodeBuddy' },
   detect,
   open,
+  launch,
 }
 
 /** A bundle is a Cordis plugin package; this one contributes no row, so its

@@ -13,9 +13,13 @@ export const codebuddyTexts = {
     zh: '未找到 codebuddy CLI（PATH 上没有可执行文件）。请先安装：npm install -g @tencent-ai/codebuddy-code，或参考 https://www.codebuddy.ai/docs/cli/cli-reference',
     en: 'codebuddy CLI not found (nothing on PATH). Install it first: npm install -g @tencent-ai/codebuddy-code, or see https://www.codebuddy.ai/docs/cli/cli-reference',
   },
-  'resume-not-implemented': {
-    zh: 'CodeBuddy 会话恢复尚未实现（--resume 在后续版本接入），请新建会话。',
-    en: 'CodeBuddy session resume is not implemented yet (--resume lands in a later iteration); please start a new session.',
+  'resume-invalid-target': {
+    zh: 'CodeBuddy 会话恢复需要有效的会话 id（--resume <id>）。',
+    en: 'CodeBuddy session resume needs a valid session id (--resume <id>).',
+  },
+  'resume-failed': {
+    zh: 'CodeBuddy 会话恢复失败：{{detail}}',
+    en: 'CodeBuddy session resume failed: {{detail}}',
   },
   'submit-after-dispose': {
     zh: 'CodeBuddy 会话已结束，无法继续发送消息。',
