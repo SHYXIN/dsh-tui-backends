@@ -29,12 +29,21 @@
  *   { "sessionId"?: string, "model"?: string,
  *     "exitAfterFirstUser"?: boolean,             // die mid-turn, never result
  *     "afterInit"?: Frame[],                       // emitted once after init
+ *     "interruptStyle"?: 'real-2.187',             // interrupts close in the T7 real-machine
+ *                                                  // form: synthesized "Interrupted by user"
+ *                                                  // assistant message + result WITHOUT
+ *                                                  // terminal_reason (default: the documented
+ *                                                  // terminal_reason:'interrupt' form)
  *     "turns"?: [{ "frames"?: Frame[],             // emitted on the Nth user message
  *                 "resultDelayMs"?: number,        // delay before the default result
- *                 "interruptResult"?: 'none' }] }  // ack interrupt, never emit result
+ *                 "interruptResult"?: 'none',      // ack interrupt, never emit result
+ *                 "hookBlocked"?: boolean,         // the turn's result carries the
+ *                                                  // hook-blocked form (below)
+ *                 "hookBlockedDetail"?: string }]  // → result.errors[0]
  *     "resume"?: {                                 // only consulted with --resume in argv
  *       "sessionId"?: string,                      // session id declared at the handshake
  *       "unknownSession"?: true,                   // exit non-zero immediately: not found
+ *       "unknownDelayMs"?: number,                 // hold the boot unresponsive, then fail
  *       "historyDelayMs"?: number,                 // pacing between history turns
  *       "history"?: [{ "user": string,             // historical user message (text)
  *                     "assistant"?: Block[],       // assistant message after the user row
@@ -118,11 +127,28 @@ const resumeFlagIndex = process.argv.indexOf('--resume')
 const resumeTargetId = resumeFlagIndex !== -1 ? process.argv[resumeFlagIndex + 1] : undefined
 const resumeSpec = resumeTargetId !== undefined ? (scenario.resume ?? {}) : null
 
+// A paced unknown-session boot: set before anything emits — the stub stays
+// silent (no init, no control responses) until the delayed loud exit.
+let unresponsiveBoot = false
+
 if (resumeSpec?.unknownSession === true) {
   // 指定会话不存在：CLI 响亮退出（非零），绝不静默回落新会话。
-  mark('exit', 1)
-  process.stderr.write(`codebuddy stub: session ${resumeTargetId} not found\n`)
-  process.exit(1)
+  // `unknownDelayMs` paces the failure (tests flip the host locale while the
+  // handshake is in flight — the emitted wording must follow the LIVE locale):
+  // during the hold the stub answers NOTHING (no init frame, no initialize
+  // response), so connect() itself rejects when the process dies.
+  const delay = resumeSpec.unknownDelayMs
+  const die = () => {
+    mark('exit', 1)
+    process.stderr.write(`codebuddy stub: session ${resumeTargetId} not found\n`)
+    process.exit(1)
+  }
+  if (typeof delay === 'number' && delay > 0) {
+    unresponsiveBoot = true
+    setTimeout(die, delay)
+  } else {
+    die()
+  }
 }
 
 const sessionId = resumeSpec !== null
@@ -134,6 +160,7 @@ let uuidCounter = 0
 const nextUuid = () => `u-${String(++uuidCounter).padStart(4, '0')}`
 
 function out(frame) {
+  if (unresponsiveBoot) return
   const filled = {
     uuid: nextUuid(),
     session_id: sessionId,
@@ -294,6 +321,26 @@ function defaultResult(extra = {}) {
   resultTimer = null
 }
 
+/** The turn's natural end — the docs-promise result. A turn scripted with
+ *  `hookBlocked` ends in the hook-blocked form instead (spec issue #1
+ *  scenario coverage): terminal_reason:'hook_blocked' on a SUCCESS result
+ *  (codebuddy-sdk notes §2.2/§8 — blocks and interrupts ride the success
+ *  subtype; terminal_reason is a runtime-only field), with the CLI's own
+ *  hook message as result.errors[0] when the script carries one. */
+function defaultTurnResult(script = null) {
+  if (script?.hookBlocked === true) {
+    defaultResult({
+      resultText: '',
+      frame: {
+        terminal_reason: 'hook_blocked',
+        ...(typeof script.hookBlockedDetail === 'string' ? { errors: [script.hookBlockedDetail] } : {}),
+      },
+    })
+    return
+  }
+  defaultResult()
+}
+
 function emitEchoTurn(userText) {
   const full = `echo: ${userText}`
   out({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'message_start', message: { id: `msg_${uuidCounter + 1}`, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } } })
@@ -343,10 +390,10 @@ async function emitScriptTurn(script) {
   if (typeof delay === 'number' && delay > 0) {
     // Leave the turn hanging until the delay or an interrupt — lets tests
     // cancel/steer mid-turn deterministically.
-    resultTimer = setTimeout(() => defaultResult(), delay)
+    resultTimer = setTimeout(() => defaultTurnResult(script), delay)
     return
   }
-  defaultResult()
+  defaultTurnResult(script)
 }
 
 function startTurn(userText) {
@@ -422,7 +469,24 @@ function handleControlRequest(line) {
       if (currentScript?.interruptResult === 'none') break // never replies — backstop line
       if (resultTimer !== null) clearTimeout(resultTimer)
       resultTimer = null
-      if (turnOpen) defaultResult({ frame: { terminal_reason: 'interrupt', result: '' } })
+      if (turnOpen) {
+        if (scenario.interruptStyle === 'real-2.187') {
+          // T7 real-machine form (bundled 2.187.0 streaming cancel, docs/
+          // live-evidence.md): the CLI synthesizes the interrupt marker as an
+          // assistant message and closes with a SUCCESS result that carries
+          // NO terminal_reason.
+          out({
+            type: 'assistant', parent_tool_use_id: null,
+            message: { id: `msg_${uuidCounter + 1}`, type: 'message', role: 'assistant', model,
+              content: [{ type: 'text', text: 'Interrupted by user' }], stop_reason: 'end_turn', stop_sequence: null,
+              usage: { input_tokens: cumulativeInput, output_tokens: cumulativeOutput } },
+          })
+          defaultResult({ resultText: '' })
+        } else {
+          // The documented form (notes §8): terminal_reason on a success result.
+          defaultResult({ frame: { terminal_reason: 'interrupt', result: '' } })
+        }
+      }
       break
     }
     default:
@@ -433,6 +497,7 @@ function handleControlRequest(line) {
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false, crlfDelay: Infinity })
 rl.on('line', raw => {
+  if (unresponsiveBoot) return
   if (!raw.trim()) return
   let line
   try {

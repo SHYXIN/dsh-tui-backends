@@ -29,6 +29,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { VALIDATED_BUNDLED_CLI_VERSION } from '../contract.js'
 
 const BUNDLE_NAME = 'dsh-tui-codebuddy'
 const BACKEND_ID = 'codebuddy'
@@ -143,6 +144,15 @@ try {
       detection?.installed === true
         ? typeof detection.version === 'string' && detection.version.length > 0
         : typeof detection?.hint === 'string' && detection.hint.length > 0,
+      JSON.stringify(detection),
+    )
+    // Version honesty (code-review fix): detect.version stays the PATH CLI's
+    // measured value, and the detection also carries the SDK-bundled CLI
+    // fact — the version the session will ACTUALLY run (which may differ).
+    check(
+      'detect carries the bundled CLI fact with a bilingual note',
+      detection?.bundledCliVersion === VALIDATED_BUNDLED_CLI_VERSION
+        && typeof detection?.note === 'string' && detection.note.includes(VALIDATED_BUNDLED_CLI_VERSION),
       JSON.stringify(detection),
     )
 

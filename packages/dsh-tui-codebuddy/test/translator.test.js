@@ -8,8 +8,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createCodebuddyTranslator, createIdentityAudit } from '../translator.js'
+import { codebuddyText } from '../text.js'
 
 const NOW = () => 1_700_000_000_000
+const enText = (key, params) => codebuddyText(key, 'en', params)
 
 /** The canonical init frame a CodeBuddy CLI emits on stream-json startup. */
 function initFrame(overrides = {}) {
@@ -287,6 +289,36 @@ test('a failed tool result carries errorText; error subtypes end the turn with k
   createIdentityAudit().check(events)
 })
 
+test('bare error payloads fall back to the bilingual dict, never a hardcoded literal', () => {
+  // Empty error text on a failed tool_result → the dict's tool-failed marker
+  // in the accessor's language (the session binds it to the live locale).
+  const en = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW, text: enText })
+  en.translate(initFrame())
+  const events = [...en.userSubmitted({ text: 'run', clientMessageId: 'u1' })]
+  events.push(...en.translate({
+    type: 'assistant', uuid: 'u-0002', session_id: 's', parent_tool_use_id: null,
+    message: { id: 'msg_1', type: 'message', role: 'assistant', model: 'stub-model',
+      content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} }],
+      stop_reason: 'tool_use', stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } },
+  }))
+  events.push(...en.translate({
+    type: 'user', uuid: 'u-0003', session_id: 's', parent_tool_use_id: 'toolu_1',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: '', is_error: true }] },
+  }))
+  assert.equal(events.find(e => e.type === 'tool.result').errorText, 'Tool failed')
+
+  // A result subtype the error family without an errors[] payload and without
+  // even a subtype string → the dict's turn-error marker.
+  const zh = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  zh.translate(initFrame())
+  zh.userSubmitted({ text: 'run', clientMessageId: 'u1' })
+  const zhEvents = zh.translate({ type: 'result', is_error: true })
+  assert.deepEqual(zhEvents.find(e => e.type === 'turn.end').reason, { kind: 'error', message: '执行出错' })
+  const enEvents = en.translate({ type: 'result', is_error: true })
+  assert.deepEqual(enEvents.find(e => e.type === 'turn.end').reason, { kind: 'error', message: 'An error occurred' })
+  createIdentityAudit().check(events)
+})
+
 test('an interrupted result (success subtype + terminal_reason) ends the turn interrupted', () => {
   const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
   translator.translate(initFrame())
@@ -315,6 +347,70 @@ test('terminal_reason variants: end_turn/absent complete, unknown values stay vi
   events = [...translator.userSubmitted({ text: 'third', clientMessageId: 'u3' })]
   events.push(...translator.translate(resultFrame({ terminal_reason: 'user_exit' })))
   assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'other', label: 'user_exit' })
+})
+
+test('terminal_reason hook_blocked maps to a blocked turn end — the host vocabulary has no hooks event family', () => {
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator.translate(initFrame())
+  const all = []
+  // The hook-blocked shape: a success result (interrupts and blocks both ride
+  // the success subtype — codebuddy-sdk notes §2.2) carrying the runtime-only
+  // terminal_reason 'hook_blocked'.
+  let events = [...translator.userSubmitted({ text: 'hi', clientMessageId: 'u1' })]
+  events.push(...translator.translate(resultFrame({ terminal_reason: 'hook_blocked', errors: ['Stop hook: push denied'] })))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'blocked', detail: 'Stop hook: push denied' })
+  all.push(...events)
+  // No CLI error strings → bare blocked, detail stays absent (no invention).
+  events = [...translator.userSubmitted({ text: 'again', clientMessageId: 'u2' })]
+  events.push(...translator.translate(resultFrame({ terminal_reason: 'hook_blocked' })))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'blocked' })
+  all.push(...events)
+  // The generic unknown-reason escape stays for values outside the mapped set.
+  events = [...translator.userSubmitted({ text: 'third', clientMessageId: 'u3' })]
+  events.push(...translator.translate(resultFrame({ terminal_reason: 'user_exit' })))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'other', label: 'user_exit' })
+  all.push(...events)
+  createIdentityAudit().check(all)
+})
+
+test('a bare "Interrupted by user" assistant message is the 2.187.0 interrupt marker — the result needs no terminal_reason', () => {
+  // T7 real-machine evidence (docs/live-evidence.md): bundled 2.187.0's
+  // streaming-cancel path sends a result WITHOUT terminal_reason and
+  // synthesizes the assistant text "Interrupted by user" as the interrupt
+  // signal. Exact match only — a longer assistant text that merely contains
+  // the words must NOT read as interrupted, and the marker must not leak
+  // across turns.
+  const translator = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator.translate(initFrame())
+  let events = [...translator.userSubmitted({ text: 'go', clientMessageId: 'u1' })]
+  events.push(...translator.translate(assistantFrame('Interrupted by user')))
+  events.push(...translator.translate(resultFrame({ result: '' }))) // real-machine form: no terminal_reason
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'interrupted' })
+  createIdentityAudit().check(events)
+
+  // A text merely CONTAINING the marker words is a legitimate completion.
+  const translator2 = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator2.translate(initFrame())
+  events = [...translator2.userSubmitted({ text: 'go', clientMessageId: 'u1' })]
+  events.push(...translator2.translate(assistantFrame('The task was Interrupted by user manually.')))
+  events.push(...translator2.translate(resultFrame()))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'completed' })
+
+  // The marker seen in turn 1 must not leak into turn 2's judgment.
+  const translator3 = createCodebuddyTranslator({ cwd: 'D:/fixture/project', now: NOW })
+  translator3.translate(initFrame())
+  events = [...translator3.userSubmitted({ text: 'a', clientMessageId: 'u1' })]
+  events.push(...translator3.translate(assistantFrame('Interrupted by user')))
+  events.push(...translator3.translate(resultFrame({ result: '' })))
+  events = [...translator3.userSubmitted({ text: 'b', clientMessageId: 'u2' })]
+  events.push(...translator3.translate(assistantFrame('all done')))
+  events.push(...translator3.translate(resultFrame()))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'completed' })
+
+  // terminal_reason='interrupt' stays the PRIMARY evidence when present.
+  events = [...translator3.userSubmitted({ text: 'c', clientMessageId: 'u3' })]
+  events.push(...translator3.translate(resultFrame({ terminal_reason: 'interrupt', result: '' })))
+  assert.deepEqual(events.find(e => e.type === 'turn.end').reason, { kind: 'interrupted' })
 })
 
 test('streaming tool-args deltas carry the partial JSON attributed to the callId', () => {

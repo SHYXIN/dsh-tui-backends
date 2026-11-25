@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { backend } from '../backend.js'
+import { VALIDATED_BUNDLED_CLI_VERSION as BUNDLED_VERSION } from '../contract.js'
 
 const FAKE_VERSION = '2.186.0-fake'
 const INSTALL_CHANNEL = 'npm install -g @tencent-ai/codebuddy-code'
@@ -46,6 +47,40 @@ test('detect finds a fake codebuddy.cmd injected via PATH and reports its versio
     const result = await backend.detect(host('zh'))
     assert.equal(result.installed, true)
     assert.equal(result.version, FAKE_VERSION)
+  })
+})
+
+test('detect is honest about the two CLIs: PATH version stays, the SDK-bundled fact is bilingual', async () => {
+  // The version field keeps the PATH CLI's measured value; the session does
+  // NOT run that CLI — the SDK resolves its own bundled CLI first (codebuddy-
+  // sdk notes §7.1). The detection therefore carries the bundled fact
+  // separately: the pinned bundled version + a bilingual sentence saying the
+  // session actually runs the bundled CLI (which may differ from PATH).
+  const world = mkdtempSync(join(tmpdir(), 'codebuddy-detect-honest-'))
+  writeFileSync(join(world, 'codebuddy.cmd'), `@echo off\r\necho ${FAKE_VERSION}\r\n`)
+  await inWorld(world, async () => {
+    for (const locale of ['zh', 'en']) {
+      const result = await backend.detect(host(locale))
+      assert.equal(result.installed, true, `locale ${locale}`)
+      assert.equal(result.version, FAKE_VERSION, 'version stays the PATH CLI measurement')
+      assert.equal(result.bundledCliVersion, BUNDLED_VERSION, 'the bundled CLI fact is the contract pin')
+      assert.equal(typeof result.note, 'string', `locale ${locale}`)
+      assert.ok(result.note.includes(BUNDLED_VERSION), `note names the bundled version (locale ${locale}): ${result.note}`)
+      assert.ok(
+        locale === 'en' ? /bundled/i.test(result.note) : result.note.includes('捆绑'),
+        `${locale} note wording: ${result.note}`,
+      )
+    }
+  })
+  // The bundled fact is present on the not-installed shape too (sessions
+  // would still run the SDK's bundled CLI).
+  const empty = mkdtempSync(join(tmpdir(), 'codebuddy-detect-empty2-'))
+  await inWorld(empty, async () => {
+    const result = await backend.detect(host('zh'))
+    assert.equal(result.installed, false)
+    assert.equal(result.bundledCliVersion, BUNDLED_VERSION)
+    assert.equal(typeof result.note, 'string')
+    assert.ok(result.note.includes(BUNDLED_VERSION))
   })
 })
 

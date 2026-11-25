@@ -15,6 +15,13 @@ export const codebuddyTexts = {
     zh: '未找到 codebuddy CLI（PATH 上没有可执行文件）。请先安装：npm install -g @tencent-ai/codebuddy-code，或参考 https://www.codebuddy.ai/docs/cli/cli-reference',
     en: 'codebuddy CLI not found (nothing on PATH). Install it first: npm install -g @tencent-ai/codebuddy-code, or see https://www.codebuddy.ai/docs/cli/cli-reference',
   },
+  // detect's version honesty: detect.version stays the PATH CLI's measured
+  // value, but the session does NOT run that CLI — the SDK resolves its own
+  // bundled CLI first. The note spells out the difference, bilingually.
+  'detect-bundled-cli': {
+    zh: '会话实际运行 SDK 捆绑的 CLI v{{version}}（与 PATH 上的全局版本可能不同）。',
+    en: 'Sessions actually run the CLI bundled with the SDK, v{{version}} (it may differ from the PATH version).',
+  },
   'resume-invalid-target': {
     zh: 'CodeBuddy 会话恢复需要有效的会话 id（--resume <id>）。',
     en: 'CodeBuddy session resume needs a valid session id (--resume <id>).',
@@ -46,6 +53,17 @@ export const codebuddyTexts = {
   'interrupt-forced-notice': {
     zh: '中断后超过 {{seconds}} 秒仍未收到 CLI 的 result，该回合已强制收口。',
     en: 'No result arrived within {{seconds}}s of the interrupt; the turn was force-settled.',
+  },
+  // Translator fallbacks for error payloads that carry no text of their own
+  // (a failed tool_result with empty content; a turn-ending result with no
+  // subtype string). Picked in the translator's bound locale, never hardcoded.
+  'tool-failed': {
+    zh: '工具执行失败',
+    en: 'Tool failed',
+  },
+  'turn-error': {
+    zh: '执行出错',
+    en: 'An error occurred',
   },
   'card-tail-dropped': {
     zh: '（前 {{count}} 行已省略）',
@@ -99,6 +117,18 @@ export const codebuddyTexts = {
     zh: '图片「{{name}}」无法读取：{{detail}}',
     en: 'The image "{{name}}" could not be read: {{detail}}',
   },
+}
+
+/** The live host-locale read, shared by every module that emits user-visible
+ *  text (host-surface notes §11: `locale()` is 必有 and read LIVE — a /lang
+ *  switch applies to the next string, never a snapshot taken at open; a
+ *  hostile locale() implementation degrades to zh, never a throw). */
+export function localeOf(host) {
+  try {
+    return host?.locale?.() === 'en' ? 'en' : 'zh'
+  } catch {
+    return 'zh'
+  }
 }
 
 /** Pick a text by locale and fill `{{name}}` params; an unknown locale/key
